@@ -5,13 +5,14 @@ const cors = require("cors");
 const nodemailer = require("nodemailer");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 // ====== Middleware Setup ======
 const corsOptions = {
-  origin: "http://localhost:5173",
+  origin: process.env.CLIENT_URL,
   credentials: true,
   optionSuccessStatus: 200,
 };
@@ -96,6 +97,37 @@ async function run() {
       res.clearCookie("jwt").json({ message: "Logged out" });
     });
 
+    // 💳 Create Stripe Checkout Session
+    app.post("/create-checkout-session", async (req, res) => {
+      const { amount } = req.body;
+
+      try {
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: "bdt", // or 'usd' etc.
+                product_data: {
+                  name: "Fund Donation",
+                },
+                unit_amount: amount * 100, // Stripe expects amount in paisa
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          success_url: `${process.env.CLIENT_URL}/funding?success=true`,
+          cancel_url: `${process.env.CLIENT_URL}/funding?canceled=true`,
+        });
+
+        res.json({ url: session.url });
+      } catch (error) {
+        console.error("Stripe Checkout Error:", error);
+        res.status(500).json({ error: "Unable to create checkout session" });
+      }
+    });
+
     // ====== SEARCH DONORS ENDPOINT ======
     app.get("/api/donors/search", async (req, res) => {
       try {
@@ -165,15 +197,38 @@ async function run() {
     });
 
     // ====== ADMIN: User Management ======
-    app.get("/api/users", verifyJWT, verifyAdmin, async (req, res) => {
+    app.get("/api/users", async (req, res) => {
       const users = await usersCollection.find().toArray();
       res.json(users);
+    });
+
+    app.get("/api/users/:email", async (req, res) => {
+      const email = req.params.email;
+      const query = { email: email };
+      const user = await usersCollection.findOne(query);
+      res.json(user);
     });
 
     app.post("/api/users", async (req, res) => {
       const user = req.body;
       const result = await usersCollection.insertOne(user);
       res.json({ success: result.acknowledged === 1 });
+    });
+
+    app.patch("/api/users/:email", async (req, res) => {
+      const email = req.params.email;
+      const user = req.body;
+      const result = await usersCollection.updateOne(
+        { email: email },
+        { $set: user }
+      );
+      res.json({ success: result.modifiedCount === 1 });
+    });
+
+    app.delete("/api/users/:email", async (req, res) => {
+      const email = req.params.email;
+      const result = await usersCollection.deleteOne({ email: email });
+      res.json({ success: result.deletedCount === 1 });
     });
 
     app.patch(
@@ -212,29 +267,286 @@ async function run() {
     });
 
     // ====== ADMIN: Donation Request Management ======
-    app.get(
-      "/api/donation-requests",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const requests = await donationRequestCollection.find().toArray();
-        res.json(requests);
-      }
-    );
+    app.get("/api/donation-requests", async (req, res) => {
+      try {
+        // Extract query parameters with default values
+        const {
+          page = 1,
+          limit = 10,
+          status,
+          bloodGroup,
+          district,
+          upazila,
+          sortBy = "createdAt",
+          sortOrder = "desc",
+          search,
+          startDate,
+          endDate,
+        } = req.query;
 
-    app.patch(
-      "/api/donation-requests/status/:id",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const { status } = req.body;
-        const result = await donationRequestCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: { status } }
-        );
-        res.json({ success: result.modifiedCount === 1 });
+        // Validate pagination parameters
+        const pageNumber = parseInt(page);
+        const limitNumber = parseInt(limit);
+
+        if (isNaN(pageNumber) || pageNumber < 1) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid page number (must be positive integer)",
+          });
+        }
+
+        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid limit (must be between 1 and 100)",
+          });
+        }
+
+        // Build filter object based on query parameters
+        const filter = {};
+
+        // Status filter
+        if (status) {
+          const validStatuses = [
+            "pending",
+            "approved",
+            "fulfilled",
+            "rejected",
+          ];
+          if (validStatuses.includes(status)) {
+            filter.status = status;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid status value",
+              validStatuses,
+            });
+          }
+        }
+
+        // Blood group filter
+        if (bloodGroup) {
+          const validBloodGroups = [
+            "A+",
+            "A-",
+            "B+",
+            "B-",
+            "AB+",
+            "AB-",
+            "O+",
+            "O-",
+          ];
+          if (validBloodGroups.includes(bloodGroup)) {
+            filter.bloodGroup = bloodGroup;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid blood group",
+              validBloodGroups,
+            });
+          }
+        }
+
+        // Location filters
+        if (district) filter.district = district;
+        if (upazila) filter.upazila = upazila;
+
+        // Date range filter
+        if (startDate || endDate) {
+          filter.createdAt = {};
+          if (startDate) {
+            filter.createdAt.$gte = new Date(startDate);
+          }
+          if (endDate) {
+            filter.createdAt.$lte = new Date(endDate);
+          }
+        }
+
+        // Text search (case-insensitive)
+        if (search) {
+          filter.$or = [
+            { recipientName: { $regex: search, $options: "i" } },
+            { hospital: { $regex: search, $options: "i" } },
+            { address: { $regex: search, $options: "i" } },
+            { message: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        // Validate sort parameters
+        const validSortFields = [
+          "createdAt",
+          "date",
+          "recipientName",
+          "status",
+        ];
+        const sortDirection = sortOrder === "asc" ? 1 : -1;
+
+        if (!validSortFields.includes(sortBy)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid sort field",
+            validSortFields,
+          });
+        }
+
+        // Execute query with pagination
+        const skip = (pageNumber - 1) * limitNumber;
+        const sort = { [sortBy]: sortDirection };
+
+        const [requests, totalCount] = await Promise.all([
+          donationRequestCollection
+            .find(filter)
+            .sort(sort)
+            .skip(skip)
+            .limit(limitNumber)
+            .toArray(),
+          donationRequestCollection.countDocuments(filter),
+        ]);
+
+        // Calculate pagination metadata
+        const totalPages = Math.ceil(totalCount / limitNumber);
+        const hasNext = pageNumber < totalPages;
+        const hasPrevious = pageNumber > 1;
+
+        // Return response with metadata
+        return res.status(200).json({
+          success: true,
+          data: requests,
+          pagination: {
+            totalItems: totalCount,
+            totalPages,
+            currentPage: pageNumber,
+            itemsPerPage: limitNumber,
+            hasNext,
+            hasPrevious,
+          },
+          filters: {
+            applied: Object.keys(filter).length > 0 ? filter : "none",
+            sort: {
+              by: sortBy,
+              order: sortOrder,
+            },
+          },
+        });
+      } catch (error) {
+        console.error("Error fetching donation requests:", error);
+        return res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message: "Failed to fetch donation requests",
+        });
       }
-    );
+    });
+
+    app.get("/api/donation-requests/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const request = await donationRequestCollection.findOne(query);
+      res.json(request);
+    });
+
+    app.post("/api/donation-requests", async (req, res) => {
+      try {
+        // Validate request body
+        const requiredFields = [
+          "recipientName",
+          "district",
+          "upazila",
+          "hospital",
+          "address",
+          "bloodGroup",
+          "date",
+          "time",
+          "message",
+        ];
+
+        const missingFields = requiredFields.filter(
+          (field) => !req.body[field]
+        );
+        if (missingFields.length > 0) {
+          return res.status(400).json({
+            success: false,
+            error: "Missing required fields",
+            missingFields,
+          });
+        }
+
+        // Validate blood group
+        const validBloodGroups = [
+          "A+",
+          "A-",
+          "B+",
+          "B-",
+          "AB+",
+          "AB-",
+          "O+",
+          "O-",
+        ];
+        if (!validBloodGroups.includes(req.body.bloodGroup)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid blood group",
+          });
+        }
+
+        // Validate date format (simple check)
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(req.body.date)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid date format (YYYY-MM-DD required)",
+          });
+        }
+
+        // Create request object with additional metadata
+        const donationRequest = {
+          ...req.body,
+          requesterName: req.body.requesterName,
+          requesterEmail: req.body.requesterEmail,
+          status: "pending",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ipAddress: req.ip,
+          userAgent: req.headers["user-agent"],
+        };
+
+        // Insert into database
+        const result = await donationRequestCollection.insertOne(
+          donationRequest
+        );
+
+        if (!result.acknowledged) {
+          throw new Error("Database insertion not acknowledged");
+        }
+
+        // Log successful creation (in a real app, use a proper logger)
+        console.log(
+          `New donation request created with ID: ${result.insertedId}`
+        );
+
+        // Return success response
+        return res.status(201).json({
+          success: true,
+          requestId: result.insertedId,
+          message: "Donation request created successfully",
+        });
+      } catch (error) {
+        console.error("Error creating donation request:", error);
+
+        return res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message: "Failed to create donation request",
+        });
+      }
+    });
+    app.patch("/api/donation-requests/status/:id", async (req, res) => {
+      const { status } = req.body;
+      const result = await donationRequestCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status } }
+      );
+      res.json({ success: result.modifiedCount === 1 });
+    });
 
     app.delete(
       "/api/donation-requests/:id",
