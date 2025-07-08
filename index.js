@@ -96,6 +96,46 @@ async function run() {
       res.clearCookie("jwt").json({ message: "Logged out" });
     });
 
+    // ====== SEARCH DONORS ENDPOINT ======
+    app.get("/api/donors/search", async (req, res) => {
+      try {
+        const { bloodGroup, district, upazila } = req.query;
+
+        // Build query
+        const query = {
+          role: "donor",
+          status: "active",
+          bloodGroup: bloodGroup,
+        };
+
+        if (district) query.district = district;
+        if (upazila) query.upazila = upazila;
+
+        // Search donors with projection
+        const donors = await usersCollection
+          .find(query, {
+            projection: {
+              _id: 1,
+              name: 1,
+              avatar: 1,
+              bloodGroup: 1,
+              district: 1,
+              upazila: 1,
+              lastDonationDate: 1,
+              email: 1,
+              phone: 1,
+            },
+          })
+          .sort({ lastDonationDate: -1 })
+          .toArray();
+
+        res.status(200).json(donors);
+      } catch (error) {
+        console.error("Search error:", error);
+        res.status(500).json({ error: "Failed to search donors" });
+      }
+    });
+
     // ====== CONTACT FORM ======
     app.post("/api/contact", async (req, res) => {
       const { name, email, message } = req.body;
@@ -108,7 +148,7 @@ async function run() {
           html: `<h2>Hi ${name},</h2>
                  <p>We received your message:</p>
                  <blockquote>${message}</blockquote>
-                 <p>We’ll respond within 24h.</p><p>— Donorly Team</p>`,
+                 <p>We'll respond within 24h.</p><p>— Donorly Team</p>`,
         });
         // notify admin
         await transporter.sendMail({
@@ -128,6 +168,12 @@ async function run() {
     app.get("/api/users", verifyJWT, verifyAdmin, async (req, res) => {
       const users = await usersCollection.find().toArray();
       res.json(users);
+    });
+
+    app.post("/api/users", async (req, res) => {
+      const user = req.body;
+      const result = await usersCollection.insertOne(user);
+      res.json({ success: result.acknowledged === 1 });
     });
 
     app.patch(
