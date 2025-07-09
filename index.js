@@ -740,23 +740,81 @@ async function run() {
 
     // blogs route
 
-    // Get all blogs (Public)
+    // Get all blogs (Public) with enhanced filtering
     app.get("/api/blogs", async (req, res) => {
       try {
-        const { status } = req.query;
-        const filter = status ? { status } : {};
+        const {
+          status,
+          search,
+          authorId,
+          page = 1,
+          limit = 10,
+          sort = "-createdAt", // Default: newest first
+        } = req.query;
 
+        const filter = {};
+
+        // Status filter (only show published blogs to public by default)
+        filter.status = status || "published";
+
+        // Author filter
+        if (authorId) {
+          filter.authorId = authorId;
+        }
+
+        // Search filter (title, content, or author name)
+        if (search) {
+          filter.$or = [
+            { title: { $regex: search, $options: "i" } },
+            { content: { $regex: search, $options: "i" } },
+            { author: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        // Parse sort parameter
+        const sortOption = {};
+        if (sort.startsWith("-")) {
+          sortOption[sort.substring(1)] = -1; // Descending
+        } else {
+          sortOption[sort] = 1; // Ascending
+        }
+
+        // Pagination calculations
+        const skip = (page - 1) * limit;
+        const totalBlogs = await blogsCollection.countDocuments(filter);
+        const totalPages = Math.ceil(totalBlogs / limit);
+
+        // Get paginated blogs with selected fields
         const blogs = await blogsCollection
           .find(filter)
-          .sort({ createdAt: -1 })
+          .sort(sortOption)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .project({
+            title: 1,
+            author: 1,
+            authorEmail: 1,
+            thumbnail: 1,
+            content: 1,
+            status: 1,
+            views: 1,
+            slug: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            _id: 1,
+          })
           .toArray();
 
         res.json({
           success: true,
           count: blogs.length,
+          total: totalBlogs,
+          page: parseInt(page),
+          totalPages,
           data: blogs,
         });
       } catch (error) {
+        console.error("Error fetching blogs:", error);
         res.status(500).json({
           success: false,
           message: "Server error fetching blogs",
@@ -795,7 +853,7 @@ async function run() {
     // Create a new blog (Admin only)
     app.post("/api/blogs", async (req, res) => {
       try {
-        const { title, content, thumbnail, status = "draft" } = req.body;
+        const { title, content, thumbnail } = req.body;
 
         if (!title || !content || !thumbnail) {
           return res.status(400).json({
@@ -805,11 +863,7 @@ async function run() {
         }
 
         const blog = {
-          title,
-          content,
-          thumbnail,
-          status,
-          authorId: new ObjectId(req.user.id),
+          ...req.body,
           createdAt: new Date(),
           updatedAt: new Date(),
         };
