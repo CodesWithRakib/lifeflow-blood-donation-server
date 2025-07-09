@@ -69,6 +69,8 @@ const client = new MongoClient(process.env.DB_URI, {
 
 let usersCollection;
 let donationRequestCollection;
+let blogsCollection;
+let fundingCollection;
 
 async function run() {
   try {
@@ -77,6 +79,7 @@ async function run() {
     usersCollection = db.collection("users");
     donationRequestCollection = db.collection("donationRequest");
     fundingCollection = db.collection("funds");
+    blogsCollection = db.collection("blogs");
 
     // ====== AUTH ROUTES ======
     app.post("/jwt", (req, res) => {
@@ -304,74 +307,141 @@ async function run() {
       }
     });
 
-    // ====== ADMIN: User Management ======
+    const { ObjectId } = require("mongodb");
+
+    // GET all users
     app.get("/api/users", async (req, res) => {
-      const users = await usersCollection.find().toArray();
-      res.json(users);
+      try {
+        const users = await usersCollection.find().toArray();
+        res.status(200).json(users);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch users", error });
+      }
     });
 
+    // GET single user by email
     app.get("/api/users/:email", async (req, res) => {
-      const email = req.params.email;
-      const query = { email: email };
-      const user = await usersCollection.findOne(query);
-      res.json(user);
+      const { email } = req.params;
+      try {
+        const user = await usersCollection.findOne({ email });
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+        res.status(200).json(user);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch user", error });
+      }
     });
 
+    // POST create user (register or sync from Firebase)
     app.post("/api/users", async (req, res) => {
       const user = req.body;
-      const result = await usersCollection.insertOne(user);
-      res.json({ success: result.acknowledged === 1 });
+
+      if (!user?.email || !user?.name) {
+        return res.status(400).json({ message: "Name and Email are required" });
+      }
+
+      try {
+        const existingUser = await usersCollection.findOne({
+          email: user.email,
+        });
+
+        if (existingUser) {
+          return res
+            .status(200)
+            .json({ message: "User already exists", user: existingUser });
+        }
+
+        const result = await usersCollection.insertOne(user);
+        res.status(201).json({
+          message: "User created",
+          success: true,
+          userId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ message: "User creation failed", error });
+      }
     });
 
+    // PATCH update user by email
     app.patch("/api/users/:email", async (req, res) => {
-      const email = req.params.email;
-      const user = req.body;
-      const result = await usersCollection.updateOne(
-        { email: email },
-        { $set: user }
-      );
-      res.json({ success: result.modifiedCount === 1 });
+      const { email } = req.params;
+      const updates = req.body;
+
+      try {
+        const result = await usersCollection.updateOne(
+          { email },
+          { $set: updates }
+        );
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "User not found or no changes made" });
+        }
+        res.status(200).json({ message: "User updated", success: true });
+      } catch (error) {
+        res.status(500).json({ message: "Update failed", error });
+      }
     });
 
-    app.delete("/api/users/:email", async (req, res) => {
-      const email = req.params.email;
-      const result = await usersCollection.deleteOne({ email: email });
-      res.json({ success: result.deletedCount === 1 });
+    // DELETE user by MongoDB _id
+    app.delete("/api/users/:id", async (req, res) => {
+      try {
+        const result = await usersCollection.deleteOne({
+          _id: new ObjectId(req.params.id),
+        });
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+        res.status(200).json({ message: "User deleted", success: true });
+      } catch (error) {
+        res.status(500).json({ message: "Delete failed", error });
+      }
     });
 
-    app.patch(
-      "/api/users/status/:id",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const { status } = req.body;
+    // PATCH update user status (e.g., active/inactive)
+    app.patch("/api/users/status/:id", async (req, res) => {
+      const { status } = req.body;
+      if (!status) {
+        return res.status(400).json({ message: "Status is required" });
+      }
+
+      try {
         const result = await usersCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           { $set: { status } }
         );
-        res.json({ success: result.modifiedCount === 1 });
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "User not found or status unchanged" });
+        }
+        res.status(200).json({ message: "Status updated", success: true });
+      } catch (error) {
+        res.status(500).json({ message: "Status update failed", error });
       }
-    );
+    });
 
-    app.patch(
-      "/api/users/role/:id",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const { role } = req.body;
+    app.patch("/api/users/role/:id", async (req, res) => {
+      const { role } = req.body;
+      if (!role) {
+        return res.status(400).json({ message: "Role is required" });
+      }
+
+      try {
         const result = await usersCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           { $set: { role } }
         );
-        res.json({ success: result.modifiedCount === 1 });
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "User not found or role unchanged" });
+        }
+        res.status(200).json({ message: "Role updated", success: true });
+      } catch (error) {
+        res.status(500).json({ message: "Role update failed", error });
       }
-    );
-
-    app.delete("/api/users/:id", verifyJWT, verifyAdmin, async (req, res) => {
-      const result = await usersCollection.deleteOne({
-        _id: new ObjectId(req.params.id),
-      });
-      res.json({ success: result.deletedCount === 1 });
     });
 
     // ====== ADMIN: Donation Request Management ======
@@ -668,6 +738,221 @@ async function run() {
       }
     );
 
+    // blogs route
+
+    // Get all blogs (Public)
+    app.get("/api/blogs", async (req, res) => {
+      try {
+        const { status } = req.query;
+        const filter = status ? { status } : {};
+
+        const blogs = await blogsCollection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.json({
+          success: true,
+          count: blogs.length,
+          data: blogs,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error fetching blogs",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get single blog (Public)
+    app.get("/api/blogs/:id", async (req, res) => {
+      try {
+        const blog = await blogsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        if (!blog) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        res.json({
+          success: true,
+          data: blog,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error fetching blog",
+          error: error.message,
+        });
+      }
+    });
+
+    // Create a new blog (Admin only)
+    app.post("/api/blogs", async (req, res) => {
+      try {
+        const { title, content, thumbnail, status = "draft" } = req.body;
+
+        if (!title || !content || !thumbnail) {
+          return res.status(400).json({
+            success: false,
+            message: "Title, content and thumbnail are required",
+          });
+        }
+
+        const blog = {
+          title,
+          content,
+          thumbnail,
+          status,
+          authorId: new ObjectId(req.user.id),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await db.collection("blogs").insertOne(blog);
+
+        res.status(201).json({
+          success: true,
+          data: { ...blog, _id: result.insertedId },
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error creating blog",
+          error: error.message,
+        });
+      }
+    });
+
+    // Update blog (Admin or Author)
+    app.put("/api/blogs/:id", async (req, res) => {
+      try {
+        const { title, content, thumbnail } = req.body;
+        const blogId = new ObjectId(req.params.id);
+
+        const blog = await blogsCollection.findOne({ _id: blogId });
+
+        if (!blog) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        // Check if user is admin or author
+        if (!blog.authorId.equals(req.user.id) && req.user.role !== "admin") {
+          return res.status(403).json({
+            success: false,
+            message: "Not authorized to update this blog",
+          });
+        }
+
+        const update = {
+          $set: {
+            title: title || blog.title,
+            content: content || blog.content,
+            thumbnail: thumbnail || blog.thumbnail,
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await blogsCollection.updateOne({ _id: blogId }, update);
+
+        if (result.modifiedCount === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "No changes made to blog",
+          });
+        }
+
+        const updatedBlog = await blogsCollection.findOne({ _id: blogId });
+
+        res.json({
+          success: true,
+          data: updatedBlog,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error updating blog",
+          error: error.message,
+        });
+      }
+    });
+
+    // Update blog status (Admin only)
+    app.patch("/api/blogs/:id/status", async (req, res) => {
+      try {
+        const { status } = req.body;
+        const validStatuses = ["draft", "published", "archived"];
+
+        if (!validStatuses.includes(status)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid status value",
+          });
+        }
+
+        const result = await blogsCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found or no changes made",
+          });
+        }
+
+        const updatedBlog = await blogsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        res.json({
+          success: true,
+          data: updatedBlog,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error updating blog status",
+          error: error.message,
+        });
+      }
+    });
+
+    // Delete blog (Admin only)
+    app.delete("/api/blogs/:id", async (req, res) => {
+      try {
+        const result = await db.collection("blogs").deleteOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        res.json({
+          success: true,
+          message: "Blog deleted successfully",
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Server error deleting blog",
+          error: error.message,
+        });
+      }
+    });
     console.log("✅ MongoDB Connected");
   } catch (err) {
     console.error("❌ DB connection error:", err);
@@ -684,3 +969,4 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   console.log(`🚀 Server listening on port ${port}`);
 });
+module.exports = app;
