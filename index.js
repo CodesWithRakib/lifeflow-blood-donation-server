@@ -76,6 +76,7 @@ async function run() {
     const db = client.db("bloodDonationApp");
     usersCollection = db.collection("users");
     donationRequestCollection = db.collection("donationRequest");
+    fundingCollection = db.collection("funds");
 
     // ====== AUTH ROUTES ======
     app.post("/jwt", (req, res) => {
@@ -97,21 +98,18 @@ async function run() {
       res.clearCookie("jwt").json({ message: "Logged out" });
     });
 
-    // 💳 Create Stripe Checkout Session
+    // ====== Stripe Checkout Session (Optional) ======
     app.post("/create-checkout-session", async (req, res) => {
       const { amount } = req.body;
-
       try {
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
           line_items: [
             {
               price_data: {
-                currency: "bdt", // or 'usd' etc.
-                product_data: {
-                  name: "Fund Donation",
-                },
-                unit_amount: amount * 100, // Stripe expects amount in paisa
+                currency: "bdt",
+                product_data: { name: "Fund Donation" },
+                unit_amount: amount * 100,
               },
               quantity: 1,
             },
@@ -120,7 +118,6 @@ async function run() {
           success_url: `${process.env.CLIENT_URL}/funding?success=true`,
           cancel_url: `${process.env.CLIENT_URL}/funding?canceled=true`,
         });
-
         res.json({ url: session.url });
       } catch (error) {
         console.error("Stripe Checkout Error:", error);
@@ -128,6 +125,117 @@ async function run() {
       }
     });
 
+    // ====== FUNDING ROUTES ======
+    // Get paginated funding records
+    app.get("/api/funds", async (req, res) => {
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+
+        const total = await fundingCollection.countDocuments();
+        const funds = await fundingCollection
+          .find()
+          .sort({ date: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        res.status(200).json({
+          data: funds,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("GET /api/funds error:", error);
+        res.status(500).json({ message: "Failed to fetch funding records" });
+      }
+    });
+
+    // Get funding statistics
+    app.get("/api/funds/stats", async (req, res) => {
+      try {
+        const totalAgg = await fundingCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                totalFunds: { $sum: "$amount" },
+                totalDonors: { $addToSet: "$email" },
+              },
+            },
+          ])
+          .toArray();
+        const recent = await fundingCollection.findOne(
+          {},
+          { sort: { date: -1 } }
+        );
+        const stats = {
+          totalFunds: totalAgg[0]?.totalFunds || 0,
+          totalDonors: totalAgg[0]?.totalDonors.length || 0,
+          recentAmount: recent?.amount || 0,
+        };
+        res.status(200).json(stats);
+      } catch (err) {
+        console.error("GET /api/funds/stats error:", err);
+        res.status(500).json({ message: "Failed to fetch stats" });
+      }
+    });
+
+    app.post("/api/funds", async (req, res) => {
+      const { userEmail, userName, amount, currency, paymentIntentId } =
+        req.body;
+
+      if (!userEmail || !amount || !paymentIntentId) {
+        return res
+          .status(400)
+          .json({ message: "Missing required donation data" });
+      }
+
+      try {
+        const donation = {
+          userEmail,
+          userName,
+          amount,
+          currency: currency || "usd",
+          paymentIntentId,
+          status: "succeeded",
+          createdAt: new Date(),
+        };
+
+        const result = await fundingCollection.insertOne(donation);
+
+        res.status(201).json({
+          message: "Donation saved successfully",
+          donationId: result.insertedId,
+        });
+      } catch (err) {
+        console.error("Error saving donation:", err);
+        res.status(500).json({ message: "Failed to save donation" });
+      }
+    });
+
+    // Create Stripe Payment Intent
+    app.post("/api/payments/create-intent", async (req, res) => {
+      const { amount, currency = "usd" } = req.body;
+      if (!amount || amount < 1)
+        return res.status(400).json({ message: "Invalid donation amount" });
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(amount * 100),
+          currency,
+          automatic_payment_methods: { enabled: true },
+        });
+        res.json({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        console.error("Stripe intent error:", error);
+        res.status(500).json({ message: "Failed to create payment intent" });
+      }
+    });
     // ====== SEARCH DONORS ENDPOINT ======
     app.get("/api/donors/search", async (req, res) => {
       try {
