@@ -67,10 +67,10 @@ const client = new MongoClient(process.env.DB_URI, {
   },
 });
 
-let usersCollection;
-let donationRequestCollection;
-let blogsCollection;
-let fundingCollection;
+let usersCollection,
+  donationRequestCollection,
+  blogsCollection,
+  fundingCollection;
 
 async function run() {
   try {
@@ -976,6 +976,68 @@ async function run() {
         res.status(500).json({
           success: false,
           message: "Server error updating blog status",
+          error: error.message,
+        });
+      }
+    });
+
+    // Increment blog views and track view details
+    app.patch("/api/blogs/:id/views", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userAgent = req.headers["user-agent"];
+        const ipAddress = req.ip || req.connection.remoteAddress;
+        const referrer = req.headers.referer || req.headers.referrer;
+
+        // Validate blog ID
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID format",
+          });
+        }
+
+        // Update the blog's view count and add view details
+        const result = await blogsCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          {
+            $inc: { views: 1 },
+            $push: {
+              viewDetails: {
+                viewedAt: new Date(),
+                userAgent,
+                ipAddress,
+                referrer,
+              },
+            },
+          },
+          {
+            returnDocument: "after",
+            projection: {
+              views: 1,
+              title: 1,
+            },
+          }
+        );
+
+        if (!result.value) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        res.json({
+          success: true,
+          message: "View counted successfully",
+          newViewCount: result.value.views,
+          blogTitle: result.value.title,
+        });
+      } catch (error) {
+        console.error("Error tracking view:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to track view",
           error: error.message,
         });
       }
