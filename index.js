@@ -519,10 +519,9 @@ async function run() {
       }
     });
 
-    // ====== ADMIN: Donation Request Management ======
+    // GET all donation requests with filters + pagination
     app.get("/api/donation-requests", async (req, res) => {
       try {
-        // Extract query parameters with default values
         const {
           page = 1,
           limit = 10,
@@ -537,85 +536,24 @@ async function run() {
           endDate,
         } = req.query;
 
-        // Validate pagination parameters
         const pageNumber = parseInt(page);
         const limitNumber = parseInt(limit);
+        const skip = (pageNumber - 1) * limitNumber;
+        const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
 
-        if (isNaN(pageNumber) || pageNumber < 1) {
-          return res.status(400).json({
-            success: false,
-            error: "Invalid page number (must be positive integer)",
-          });
-        }
-
-        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
-          return res.status(400).json({
-            success: false,
-            error: "Invalid limit (must be between 1 and 100)",
-          });
-        }
-
-        // Build filter object based on query parameters
         const filter = {};
 
-        // Status filter
-        if (status) {
-          const validStatuses = [
-            "pending",
-            "approved",
-            "fulfilled",
-            "rejected",
-          ];
-          if (validStatuses.includes(status)) {
-            filter.status = status;
-          } else {
-            return res.status(400).json({
-              success: false,
-              error: "Invalid status value",
-              validStatuses,
-            });
-          }
-        }
-
-        // Blood group filter
-        if (bloodGroup) {
-          const validBloodGroups = [
-            "A+",
-            "A-",
-            "B+",
-            "B-",
-            "AB+",
-            "AB-",
-            "O+",
-            "O-",
-          ];
-          if (validBloodGroups.includes(bloodGroup)) {
-            filter.bloodGroup = bloodGroup;
-          } else {
-            return res.status(400).json({
-              success: false,
-              error: "Invalid blood group",
-              validBloodGroups,
-            });
-          }
-        }
-
-        // Location filters
+        if (status) filter.status = status;
+        if (bloodGroup) filter.bloodGroup = bloodGroup;
         if (district) filter.district = district;
         if (upazila) filter.upazila = upazila;
 
-        // Date range filter
         if (startDate || endDate) {
           filter.createdAt = {};
-          if (startDate) {
-            filter.createdAt.$gte = new Date(startDate);
-          }
-          if (endDate) {
-            filter.createdAt.$lte = new Date(endDate);
-          }
+          if (startDate) filter.createdAt.$gte = new Date(startDate);
+          if (endDate) filter.createdAt.$lte = new Date(endDate);
         }
 
-        // Text search (case-insensitive)
         if (search) {
           filter.$or = [
             { recipientName: { $regex: search, $options: "i" } },
@@ -624,27 +562,6 @@ async function run() {
             { message: { $regex: search, $options: "i" } },
           ];
         }
-
-        // Validate sort parameters
-        const validSortFields = [
-          "createdAt",
-          "date",
-          "recipientName",
-          "status",
-        ];
-        const sortDirection = sortOrder === "asc" ? 1 : -1;
-
-        if (!validSortFields.includes(sortBy)) {
-          return res.status(400).json({
-            success: false,
-            error: "Invalid sort field",
-            validSortFields,
-          });
-        }
-
-        // Execute query with pagination
-        const skip = (pageNumber - 1) * limitNumber;
-        const sort = { [sortBy]: sortDirection };
 
         const [requests, totalCount] = await Promise.all([
           donationRequestCollection
@@ -656,13 +573,9 @@ async function run() {
           donationRequestCollection.countDocuments(filter),
         ]);
 
-        // Calculate pagination metadata
         const totalPages = Math.ceil(totalCount / limitNumber);
-        const hasNext = pageNumber < totalPages;
-        const hasPrevious = pageNumber > 1;
 
-        // Return response with metadata
-        return res.status(200).json({
+        res.status(200).json({
           success: true,
           data: requests,
           pagination: {
@@ -670,135 +583,150 @@ async function run() {
             totalPages,
             currentPage: pageNumber,
             itemsPerPage: limitNumber,
-            hasNext,
-            hasPrevious,
-          },
-          filters: {
-            applied: Object.keys(filter).length > 0 ? filter : "none",
-            sort: {
-              by: sortBy,
-              order: sortOrder,
-            },
+            hasNext: pageNumber < totalPages,
+            hasPrevious: pageNumber > 1,
           },
         });
       } catch (error) {
         console.error("Error fetching donation requests:", error);
-        return res.status(500).json({
-          success: false,
-          error: "Internal server error",
-          message: "Failed to fetch donation requests",
-        });
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
       }
     });
 
-    app.get("/api/donation-requests/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const request = await donationRequestCollection.findOne(query);
-      res.json(request);
+    // GET recent 3 donation requests (sorted by date descending)
+    app.get("/api/donation-requests/recent", async (req, res) => {
+      try {
+        const recentRequests = await donationRequestCollection
+          .find()
+          .sort({ date: -1 })
+          .limit(3)
+          .toArray();
+        res.json({ success: true, data: recentRequests });
+      } catch (error) {
+        console.error("Error fetching recent requests:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
     });
 
+    // GET single donation request by ID
+    app.get("/api/donation-requests/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const request = await donationRequestCollection.findOne(query);
+        if (!request) {
+          return res.status(404).json({ success: false, error: "Not found" });
+        }
+        res.json(request);
+      } catch (error) {
+        console.error("Error fetching request:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
+    });
+
+    // POST new donation request
     app.post("/api/donation-requests", async (req, res) => {
       try {
-        // Validate request body
+        const {
+          recipientName,
+          district,
+          upazila,
+          hospital,
+          address,
+          bloodGroup,
+          date,
+          time,
+          message,
+          requesterName,
+          requesterEmail,
+        } = req.body;
+
         const requiredFields = [
-          "recipientName",
-          "district",
-          "upazila",
-          "hospital",
-          "address",
-          "bloodGroup",
-          "date",
-          "time",
-          "message",
+          recipientName,
+          district,
+          upazila,
+          hospital,
+          address,
+          bloodGroup,
+          date,
+          time,
+          message,
         ];
 
-        const missingFields = requiredFields.filter(
-          (field) => !req.body[field]
-        );
-        if (missingFields.length > 0) {
-          return res.status(400).json({
-            success: false,
-            error: "Missing required fields",
-            missingFields,
-          });
+        if (requiredFields.some((f) => !f)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Missing required fields" });
         }
 
-        // Validate blood group
-        const validBloodGroups = [
-          "A+",
-          "A-",
-          "B+",
-          "B-",
-          "AB+",
-          "AB-",
-          "O+",
-          "O-",
-        ];
-        if (!validBloodGroups.includes(req.body.bloodGroup)) {
-          return res.status(400).json({
-            success: false,
-            error: "Invalid blood group",
-          });
-        }
-
-        // Validate date format (simple check)
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(req.body.date)) {
-          return res.status(400).json({
-            success: false,
-            error: "Invalid date format (YYYY-MM-DD required)",
-          });
-        }
-
-        // Create request object with additional metadata
-        const donationRequest = {
-          ...req.body,
-          requesterName: req.body.requesterName,
-          requesterEmail: req.body.requesterEmail,
+        const newRequest = {
+          recipientName,
+          district,
+          upazila,
+          hospital,
+          address,
+          bloodGroup,
+          date,
+          time,
+          message,
+          requesterName,
+          requesterEmail,
           status: "pending",
           createdAt: new Date(),
           updatedAt: new Date(),
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"],
         };
 
-        // Insert into database
-        const result = await donationRequestCollection.insertOne(
-          donationRequest
-        );
-
-        if (!result.acknowledged) {
-          throw new Error("Database insertion not acknowledged");
-        }
-
-        // Log successful creation (in a real app, use a proper logger)
-        console.log(
-          `New donation request created with ID: ${result.insertedId}`
-        );
-
-        // Return success response
-        return res.status(201).json({
+        const result = await donationRequestCollection.insertOne(newRequest);
+        res.status(201).json({
           success: true,
           requestId: result.insertedId,
-          message: "Donation request created successfully",
+          message: "Request created successfully",
         });
       } catch (error) {
         console.error("Error creating donation request:", error);
-
-        return res.status(500).json({
-          success: false,
-          error: "Internal server error",
-          message: "Failed to create donation request",
-        });
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
       }
     });
+
+    // PATCH donation status
     app.patch("/api/donation-requests/status/:id", async (req, res) => {
-      const { status } = req.body;
-      const result = await donationRequestCollection.updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { status } }
-      );
-      res.json({ success: result.modifiedCount === 1 });
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+        const validStatuses = ["pending", "inprogress", "done", "canceled"];
+
+        if (!validStatuses.includes(status)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid status" });
+        }
+
+        const result = await donationRequestCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+
+        res.json({
+          success: result.modifiedCount === 1,
+          message:
+            result.modifiedCount === 1
+              ? "Status updated successfully"
+              : "No changes made",
+        });
+      } catch (error) {
+        console.error("Error updating donation status:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
     });
 
     app.delete(
@@ -812,8 +740,6 @@ async function run() {
         res.json({ success: result.deletedCount === 1 });
       }
     );
-
-    // blogs route
 
     // Get all blogs (Public) with enhanced filtering
     app.get("/api/blogs", async (req, res) => {
