@@ -12,9 +12,10 @@ const port = process.env.PORT || 5000;
 
 // ====== Middleware Setup ======
 const corsOptions = {
-  origin: process.env.CLIENT_URL,
+  origin: ["http://localhost:5173"], // you can allow multiple origins if needed
   credentials: true,
-  optionSuccessStatus: 200,
+  methods: ["GET", "POST", "PATCH", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 };
 app.use(cors(corsOptions));
 app.use(express.json());
@@ -30,18 +31,25 @@ const transporter = nodemailer.createTransport({
 });
 
 // ====== JWT Middleware ======
+
 const verifyJWT = (req, res, next) => {
-  const token = req.cookies?.jwt;
-  if (!token) {
-    return res.status(401).json({ success: false, message: "Unauthorized" });
-  }
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ success: false, message: "Forbidden" });
-    }
-    req.userEmail = decoded.email;
+  const token = req.cookies.jwt;
+
+  console.log(token);
+  if (!token)
+    return res
+      .status(401)
+      .json({ message: "Unauthorized access. No token provided." });
+
+  try {
+    const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+    req.decoded = decoded;
     next();
-  });
+  } catch (error) {
+    return res
+      .status(403)
+      .json({ message: "Forbidden access. Invalid token." });
+  }
 };
 
 // ====== Admin Role Check ======
@@ -72,6 +80,9 @@ let usersCollection,
   blogsCollection,
   fundingCollection;
 
+const allowedStatuses = ["active", "blocked", "inactive"];
+const allowedRoles = ["donor", "volunteer", "admin"];
+
 async function run() {
   try {
     await client.connect();
@@ -85,20 +96,19 @@ async function run() {
     app.post("/jwt", (req, res) => {
       const { email } = req.body;
       if (!email) return res.status(400).json({ message: "Email required" });
+
       const token = jwt.sign({ email }, process.env.ACCESS_TOKEN_SECRET, {
         expiresIn: "7d",
       });
+
       res
         .cookie("jwt", token, {
           httpOnly: true,
-          secure: process.env.NODE_ENV === "production",
-          sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
+          secure: process.env.NODE_ENV === "production", // ✅ HTTPS-only in prod
+          sameSite: process.env.NODE_ENV === "production" ? "none" : "strict", // ✅ CORS-safe
+          maxAge: 7 * 24 * 60 * 60 * 1000, // ⏰ Good to add explicit expiration (7 days)
         })
-        .json({ message: "JWT set" });
-    });
-
-    app.post("/logout", (req, res) => {
-      res.clearCookie("jwt").json({ message: "Logged out" });
+        .json({ message: "JWT set", token });
     });
 
     // ====== Stripe Checkout Session (Optional) ======
@@ -310,23 +320,33 @@ async function run() {
     const { ObjectId } = require("mongodb");
 
     // GET all users
-    app.get("/api/users", async (req, res) => {
+    app.get("/api/user", verifyJWT, async (req, res) => {
+      const email = req.decoded?.email;
+
       try {
-        const users = await usersCollection.find().toArray();
-        res.status(200).json(users);
+        const user = await usersCollection.findOne({ email });
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        res.status(200).json(user);
       } catch (error) {
-        res.status(500).json({ message: "Failed to fetch users", error });
+        res.status(500).json({ message: "Failed to fetch user", error });
       }
     });
 
-    // GET single user by email
-    app.get("/api/users/:email", async (req, res) => {
-      const { email } = req.params;
+    app.get("/api/users/:email", verifyJWT, async (req, res) => {
+      const requestedEmail = req.params.email;
+      const decodedEmail = req.decoded?.email;
+
+      if (decodedEmail !== requestedEmail) {
+        return res.status(403).json({
+          message: "Access denied. You can only access your own data.",
+        });
+      }
+
       try {
-        const user = await usersCollection.findOne({ email });
-        if (!user) {
-          return res.status(404).json({ message: "User not found" });
-        }
+        const user = await usersCollection.findOne({ email: requestedEmail });
+        if (!user) return res.status(404).json({ message: "User not found" });
+
         res.status(200).json(user);
       } catch (error) {
         res.status(500).json({ message: "Failed to fetch user", error });
@@ -335,24 +355,45 @@ async function run() {
 
     // POST create user (register or sync from Firebase)
     app.post("/api/users", async (req, res) => {
-      const user = req.body;
+      const {
+        name,
+        email,
+        avatar,
+        bloodGroup,
+        district,
+        upazila,
+        role,
+        status,
+      } = req.body;
 
-      if (!user?.email || !user?.name) {
+      if (!email || !name) {
         return res.status(400).json({ message: "Name and Email are required" });
       }
 
       try {
-        const existingUser = await usersCollection.findOne({
-          email: user.email,
-        });
+        const existingUser = await usersCollection.findOne({ email });
 
         if (existingUser) {
-          return res
-            .status(200)
-            .json({ message: "User already exists", user: existingUser });
+          return res.status(200).json({
+            message: "User already exists",
+            user: existingUser,
+          });
         }
 
-        const result = await usersCollection.insertOne(user);
+        const newUser = {
+          name,
+          email,
+          avatar: avatar || null,
+          bloodGroup: bloodGroup || null,
+          district: district || null,
+          upazila: upazila || null,
+          role: role || "donor",
+          status: status || "active",
+          createdAt: new Date(),
+        };
+
+        const result = await usersCollection.insertOne(newUser);
+
         res.status(201).json({
           message: "User created",
           success: true,
@@ -386,13 +427,22 @@ async function run() {
 
     // DELETE user by MongoDB _id
     app.delete("/api/users/:id", async (req, res) => {
+      const { id } = req.params;
+
+      // Validate ObjectId format
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+
       try {
         const result = await usersCollection.deleteOne({
-          _id: new ObjectId(req.params.id),
+          _id: new ObjectId(id),
         });
+
         if (result.deletedCount === 0) {
           return res.status(404).json({ message: "User not found" });
         }
+
         res.status(200).json({ message: "User deleted", success: true });
       } catch (error) {
         res.status(500).json({ message: "Delete failed", error });
@@ -400,22 +450,35 @@ async function run() {
     });
 
     // PATCH update user status (e.g., active/inactive)
+
     app.patch("/api/users/status/:id", async (req, res) => {
       const { status } = req.body;
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+
       if (!status) {
         return res.status(400).json({ message: "Status is required" });
       }
 
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({ message: "Invalid status value" });
+      }
+
       try {
         const result = await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
+          { _id: new ObjectId(id) },
           { $set: { status } }
         );
+
         if (result.modifiedCount === 0) {
           return res
             .status(404)
             .json({ message: "User not found or status unchanged" });
         }
+
         res.status(200).json({ message: "Status updated", success: true });
       } catch (error) {
         res.status(500).json({ message: "Status update failed", error });
@@ -424,20 +487,32 @@ async function run() {
 
     app.patch("/api/users/role/:id", async (req, res) => {
       const { role } = req.body;
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+
       if (!role) {
         return res.status(400).json({ message: "Role is required" });
       }
 
+      if (!allowedRoles.includes(role)) {
+        return res.status(400).json({ message: "Invalid role value" });
+      }
+
       try {
         const result = await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
+          { _id: new ObjectId(id) },
           { $set: { role } }
         );
+
         if (result.modifiedCount === 0) {
           return res
             .status(404)
             .json({ message: "User not found or role unchanged" });
         }
+
         res.status(200).json({ message: "Role updated", success: true });
       } catch (error) {
         res.status(500).json({ message: "Role update failed", error });
