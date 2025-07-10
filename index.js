@@ -33,9 +33,7 @@ const transporter = nodemailer.createTransport({
 // ====== JWT Middleware ======
 
 const verifyJWT = (req, res, next) => {
-  const token = req.cookies.jwt;
-
-  console.log(token);
+  const token = req.cookies?.jwt;
   if (!token)
     return res
       .status(401)
@@ -320,16 +318,49 @@ async function run() {
     const { ObjectId } = require("mongodb");
 
     // GET all users
-    app.get("/api/user", verifyJWT, async (req, res) => {
-      const email = req.decoded?.email;
 
+    app.get("/api/users", verifyJWT, async (req, res) => {
       try {
-        const user = await usersCollection.findOne({ email });
-        if (!user) return res.status(404).json({ message: "User not found" });
-
-        res.status(200).json(user);
+        const users = await usersCollection.find({}).toArray();
+        res.status(200).json(users);
       } catch (error) {
-        res.status(500).json({ message: "Failed to fetch user", error });
+        res.status(500).json({ message: "Failed to fetch users", error });
+      }
+    });
+
+    app.get("/api/user", verifyJWT, async (req, res) => {
+      try {
+        const email = req.decoded?.email;
+        // Validate email exists in token
+        if (!email) {
+          return res.status(401).json({
+            success: false,
+            message: "Unauthorized - Missing user identification",
+          });
+        }
+
+        const user = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+        });
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        res.status(200).json({
+          success: true,
+          data: user,
+        });
+      } catch (error) {
+        console.error("Error fetching user:", error);
+        res.status(500).json({
+          success: false,
+          message: "Internal server error",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
@@ -362,48 +393,82 @@ async function run() {
         bloodGroup,
         district,
         upazila,
-        role,
-        status,
+        role = "donor",
+        status = "active",
       } = req.body;
 
+      // Validate required fields
       if (!email || !name) {
-        return res.status(400).json({ message: "Name and Email are required" });
+        return res.status(400).json({
+          success: false,
+          message: "Name and email are required",
+          field: !email ? "email" : "name",
+        });
+      }
+
+      // Validate email format
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid email format",
+          field: "email",
+        });
       }
 
       try {
-        const existingUser = await usersCollection.findOne({ email });
+        // Case-insensitive email check
+        const existingUser = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+        });
 
         if (existingUser) {
           return res.status(200).json({
+            success: true,
             message: "User already exists",
-            user: existingUser,
+            data: {
+              userId: existingUser._id,
+              email: existingUser.email,
+            },
           });
         }
 
+        // Create new user document
         const newUser = {
-          name,
-          email,
+          name: name.trim(),
+          email: email.toLowerCase().trim(),
           avatar: avatar || null,
           bloodGroup: bloodGroup || null,
           district: district || null,
           upazila: upazila || null,
-          role: role || "donor",
-          status: status || "active",
+          role,
+          status,
           createdAt: new Date(),
+          updatedAt: new Date(),
         };
 
+        // Insert with additional validation
         const result = await usersCollection.insertOne(newUser);
 
+        // Return response without sensitive data
         res.status(201).json({
-          message: "User created",
           success: true,
-          userId: result.insertedId,
+          message: "User created successfully",
+          data: {
+            userId: result.insertedId,
+            email: newUser.email,
+            name: newUser.name,
+          },
         });
       } catch (error) {
-        res.status(500).json({ message: "User creation failed", error });
+        console.error("User creation error:", error);
+        res.status(500).json({
+          success: false,
+          message: "User creation failed",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
-
     // PATCH update user by email
     app.patch("/api/users/:email", async (req, res) => {
       const { email } = req.params;
