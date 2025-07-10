@@ -34,10 +34,11 @@ const transporter = nodemailer.createTransport({
 
 const verifyJWT = (req, res, next) => {
   const token = req.cookies?.jwt;
-  if (!token)
+  if (!token) {
     return res
       .status(401)
       .json({ message: "Unauthorized access. No token provided." });
+  }
 
   try {
     const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
@@ -315,12 +316,20 @@ async function run() {
       }
     });
 
-    const { ObjectId } = require("mongodb");
-
-    // GET all users
-
+    // ==============================
+    // GET all users (Admin only)
+    // ==============================
     app.get("/api/users", verifyJWT, async (req, res) => {
       try {
+        const email = req.decoded?.email;
+        const user = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+        });
+
+        if (user?.role !== "admin") {
+          return res.status(403).json({ message: "Forbidden: Admins only." });
+        }
+
         const users = await usersCollection.find({}).toArray();
         res.status(200).json(users);
       } catch (error) {
@@ -328,20 +337,24 @@ async function run() {
       }
     });
 
+    // ==============================
+    // GET logged-in user info
+    // ==============================
     app.get("/api/user", verifyJWT, async (req, res) => {
       try {
         const email = req.decoded?.email;
-        // Validate email exists in token
+
         if (!email) {
           return res.status(401).json({
             success: false,
-            message: "Unauthorized - Missing user identification",
+            message: "Unauthorized - Missing email in token",
           });
         }
 
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${email}$`, "i") },
         });
+
         if (!user) {
           return res.status(404).json({
             success: false,
@@ -364,29 +377,104 @@ async function run() {
       }
     });
 
+    // ==============================
+    // GET specific user by email (self or admin)
+    // ==============================
     app.get("/api/users/:email", verifyJWT, async (req, res) => {
       const requestedEmail = req.params.email;
       const decodedEmail = req.decoded?.email;
 
-      if (decodedEmail !== requestedEmail) {
-        return res.status(403).json({
-          message: "Access denied. You can only access your own data.",
-        });
-      }
-
       try {
-        const user = await usersCollection.findOne({ email: requestedEmail });
-        if (!user) return res.status(404).json({ message: "User not found" });
+        const requestingUser = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${decodedEmail}$`, "i") },
+        });
 
-        res.status(200).json(user);
+        if (!requestingUser) {
+          return res.status(404).json({ message: "Requesting user not found" });
+        }
+
+        if (
+          requestingUser.role !== "admin" &&
+          decodedEmail !== requestedEmail
+        ) {
+          return res.status(403).json({
+            message: "Access denied. You can only access your own data.",
+          });
+        }
+
+        const targetUser = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${requestedEmail}$`, "i") },
+        });
+
+        if (!targetUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json(targetUser);
       } catch (error) {
         res.status(500).json({ message: "Failed to fetch user", error });
       }
     });
 
-    // POST create user (register or sync from Firebase)
+    // ==============================
+    // CHECK admin status of current user
+    // ==============================
+    app.get("/api/users/check-admin", verifyJWT, async (req, res) => {
+      try {
+        const email = req.decoded?.email;
+
+        if (!email) {
+          return res.status(401).json({
+            success: false,
+            message: "Unauthorized - No email in token",
+          });
+        }
+
+        const user = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+          status: "active",
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found or inactive",
+            errorCode: "USER_NOT_FOUND",
+          });
+        }
+
+        const isAdmin = user.role === "admin";
+
+        res.status(200).json({
+          success: true,
+          isAdmin,
+          user: {
+            firebaseUid: user.firebaseUid,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            role: user.role,
+            bloodGroup: user.bloodGroup,
+            district: user.district,
+            upazila: user.upazila,
+            status: user.status,
+          },
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Internal server error",
+          errorCode: "SERVER_ERROR",
+        });
+      }
+    });
+
+    // ==============================
+    // POST create user
+    // ==============================
     app.post("/api/users", async (req, res) => {
       const {
+        firebaseUid,
         name,
         email,
         avatar,
@@ -397,7 +485,6 @@ async function run() {
         status = "active",
       } = req.body;
 
-      // Validate required fields
       if (!email || !name) {
         return res.status(400).json({
           success: false,
@@ -406,7 +493,6 @@ async function run() {
         });
       }
 
-      // Validate email format
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         return res.status(400).json({
           success: false,
@@ -416,7 +502,6 @@ async function run() {
       }
 
       try {
-        // Case-insensitive email check
         const existingUser = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${email}$`, "i") },
         });
@@ -432,8 +517,8 @@ async function run() {
           });
         }
 
-        // Create new user document
         const newUser = {
+          firebaseUid,
           name: name.trim(),
           email: email.toLowerCase().trim(),
           avatar: avatar || null,
@@ -446,10 +531,8 @@ async function run() {
           updatedAt: new Date(),
         };
 
-        // Insert with additional validation
         const result = await usersCollection.insertOne(newUser);
 
-        // Return response without sensitive data
         res.status(201).json({
           success: true,
           message: "User created successfully",
@@ -460,7 +543,6 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("User creation error:", error);
         res.status(500).json({
           success: false,
           message: "User creation failed",
@@ -469,7 +551,10 @@ async function run() {
         });
       }
     });
+
+    // ==============================
     // PATCH update user by email
+    // ==============================
     app.patch("/api/users/:email", async (req, res) => {
       const { email } = req.params;
       const updates = req.body;
@@ -479,22 +564,25 @@ async function run() {
           { email },
           { $set: updates }
         );
+
         if (result.modifiedCount === 0) {
           return res
             .status(404)
             .json({ message: "User not found or no changes made" });
         }
+
         res.status(200).json({ message: "User updated", success: true });
       } catch (error) {
         res.status(500).json({ message: "Update failed", error });
       }
     });
 
-    // DELETE user by MongoDB _id
+    // ==============================
+    // DELETE user by MongoDB ID
+    // ==============================
     app.delete("/api/users/:id", async (req, res) => {
       const { id } = req.params;
 
-      // Validate ObjectId format
       if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: "Invalid user ID" });
       }
@@ -514,8 +602,9 @@ async function run() {
       }
     });
 
-    // PATCH update user status (e.g., active/inactive)
-
+    // ==============================
+    // PATCH update user status
+    // ==============================
     app.patch("/api/users/status/:id", async (req, res) => {
       const { status } = req.body;
       const { id } = req.params;
@@ -524,12 +613,8 @@ async function run() {
         return res.status(400).json({ message: "Invalid user ID" });
       }
 
-      if (!status) {
-        return res.status(400).json({ message: "Status is required" });
-      }
-
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({ message: "Invalid status value" });
+      if (!status || !allowedStatuses.includes(status)) {
+        return res.status(400).json({ message: "Invalid or missing status" });
       }
 
       try {
@@ -550,6 +635,9 @@ async function run() {
       }
     });
 
+    // ==============================
+    // PATCH update user role
+    // ==============================
     app.patch("/api/users/role/:id", async (req, res) => {
       const { role } = req.body;
       const { id } = req.params;
@@ -558,12 +646,8 @@ async function run() {
         return res.status(400).json({ message: "Invalid user ID" });
       }
 
-      if (!role) {
-        return res.status(400).json({ message: "Role is required" });
-      }
-
-      if (!allowedRoles.includes(role)) {
-        return res.status(400).json({ message: "Invalid role value" });
+      if (!role || !allowedRoles.includes(role)) {
+        return res.status(400).json({ message: "Invalid or missing role" });
       }
 
       try {
@@ -761,6 +845,69 @@ async function run() {
       }
     });
 
+    app.patch("/api/donation-requests/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const {
+          recipientName,
+          district,
+          upazila,
+          hospital,
+          address,
+          bloodGroup,
+          date,
+          time,
+          message,
+        } = req.body;
+
+        // Basic validation
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid ID format" });
+        }
+
+        const updateData = {
+          recipientName,
+          district,
+          upazila,
+          hospital,
+          address,
+          bloodGroup,
+          date,
+          time,
+          message,
+          updatedAt: new Date(),
+          status: "pending", // Reset status when edited
+        };
+
+        const result = await donationRequestCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res
+            .status(404)
+            .json({ success: false, error: "Request not found" });
+        }
+
+        res.json({
+          success: result.modifiedCount === 1,
+          message:
+            result.modifiedCount === 1
+              ? "Request updated successfully"
+              : "No changes made",
+          data: updateData,
+        });
+      } catch (error) {
+        console.error("Error updating donation request:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
+    });
+
     // PATCH donation status
     app.patch("/api/donation-requests/status/:id", async (req, res) => {
       try {
@@ -806,29 +953,26 @@ async function run() {
       }
     );
 
-    // Get all blogs (Public) with enhanced filtering
+    // Get all blogs with filtering and pagination
     app.get("/api/blogs", async (req, res) => {
       try {
         const {
-          status,
+          status = "published",
           search,
           authorId,
           page = 1,
           limit = 10,
-          sort = "-createdAt", // Default: newest first
+          sort = "-createdAt",
         } = req.query;
 
-        const filter = {};
-
-        // Status filter (only show published blogs to public by default)
-        filter.status = status || "published";
+        const filter = { status };
 
         // Author filter
         if (authorId) {
-          filter.authorId = authorId;
+          filter.authorId = new ObjectId(authorId);
         }
 
-        // Search filter (title, content, or author name)
+        // Search filter
         if (search) {
           filter.$or = [
             { title: { $regex: search, $options: "i" } },
@@ -837,38 +981,37 @@ async function run() {
           ];
         }
 
-        // Parse sort parameter
+        // Sort option
         const sortOption = {};
         if (sort.startsWith("-")) {
-          sortOption[sort.substring(1)] = -1; // Descending
+          sortOption[sort.substring(1)] = -1;
         } else {
-          sortOption[sort] = 1; // Ascending
+          sortOption[sort] = 1;
         }
 
-        // Pagination calculations
+        // Pagination
         const skip = (page - 1) * limit;
         const totalBlogs = await blogsCollection.countDocuments(filter);
         const totalPages = Math.ceil(totalBlogs / limit);
 
-        // Get paginated blogs with selected fields
+        // Projection
+        const projection = {
+          title: 1,
+          author: 1,
+          thumbnail: 1,
+          status: 1,
+          views: 1,
+          createdAt: 1,
+          slug: 1,
+          _id: 1,
+        };
+
         const blogs = await blogsCollection
           .find(filter)
           .sort(sortOption)
           .skip(skip)
           .limit(parseInt(limit))
-          .project({
-            title: 1,
-            author: 1,
-            authorEmail: 1,
-            thumbnail: 1,
-            content: 1,
-            status: 1,
-            views: 1,
-            slug: 1,
-            createdAt: 1,
-            updatedAt: 1,
-            _id: 1,
-          })
+          .project(projection)
           .toArray();
 
         res.json({
@@ -889,9 +1032,16 @@ async function run() {
       }
     });
 
-    // Get single blog (Public)
+    // Get single blog
     app.get("/api/blogs/:id", async (req, res) => {
       try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
         const blog = await blogsCollection.findOne({
           _id: new ObjectId(req.params.id),
         });
@@ -916,29 +1066,59 @@ async function run() {
       }
     });
 
-    // Create a new blog (Admin only)
+    // Create new blog
     app.post("/api/blogs", async (req, res) => {
       try {
-        const { title, content, thumbnail } = req.body;
+        const { title, content, thumbnail, authorId } = req.body;
 
-        if (!title || !content || !thumbnail) {
+        if (!title || !content || !thumbnail || !authorId) {
           return res.status(400).json({
             success: false,
-            message: "Title, content and thumbnail are required",
+            message: "Title, content, thumbnail and authorId are required",
           });
         }
 
-        const blog = {
-          ...req.body,
+        // Get author info
+        const author = await usersCollection.findOne({
+          _id: new ObjectId(authorId),
+        });
+
+        if (!author) {
+          return res.status(400).json({
+            success: false,
+            message: "Author not found",
+          });
+        }
+
+        const slug = title
+          .toLowerCase()
+          .replace(/[^\w\s]/gi, "")
+          .replace(/\s+/g, "-");
+
+        const newBlog = {
+          title,
+          content,
+          thumbnail,
+          author: author.name,
+          authorId: new ObjectId(authorId),
+          authorEmail: author.email,
+          status: "draft",
+          views: 0,
+          comments: [],
+          likes: [],
           createdAt: new Date(),
           updatedAt: new Date(),
+          slug,
         };
 
-        const result = await db.collection("blogs").insertOne(blog);
+        const result = await blogsCollection.insertOne(newBlog);
 
         res.status(201).json({
           success: true,
-          data: { ...blog, _id: result.insertedId },
+          data: {
+            ...newBlog,
+            _id: result.insertedId,
+          },
         });
       } catch (error) {
         res.status(500).json({
@@ -949,9 +1129,16 @@ async function run() {
       }
     });
 
-    // Update blog (Admin or Author)
+    // Update blog
     app.put("/api/blogs/:id", async (req, res) => {
       try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
         const { title, content, thumbnail } = req.body;
         const blogId = new ObjectId(req.params.id);
 
@@ -961,14 +1148,6 @@ async function run() {
           return res.status(404).json({
             success: false,
             message: "Blog not found",
-          });
-        }
-
-        // Check if user is admin or author
-        if (!blog.authorId.equals(req.user.id) && req.user.role !== "admin") {
-          return res.status(403).json({
-            success: false,
-            message: "Not authorized to update this blog",
           });
         }
 
@@ -1005,9 +1184,16 @@ async function run() {
       }
     });
 
-    // Update blog status (Admin only)
+    // Update blog status
     app.patch("/api/blogs/:id/status", async (req, res) => {
       try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
         const { status } = req.body;
         const validStatuses = ["draft", "published", "archived"];
 
@@ -1047,42 +1233,32 @@ async function run() {
       }
     });
 
-    // Increment blog views and track view details
+    // Track blog view
     app.patch("/api/blogs/:id/views", async (req, res) => {
       try {
-        const { id } = req.params;
-        const userAgent = req.headers["user-agent"];
-        const ipAddress = req.ip || req.connection.remoteAddress;
-        const referrer = req.headers.referer || req.headers.referrer;
-
-        // Validate blog ID
-        if (!ObjectId.isValid(id)) {
+        if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid blog ID format",
+            message: "Invalid blog ID",
           });
         }
 
-        // Update the blog's view count and add view details
         const result = await blogsCollection.findOneAndUpdate(
-          { _id: new ObjectId(id) },
+          { _id: new ObjectId(req.params.id) },
           {
             $inc: { views: 1 },
             $push: {
               viewDetails: {
                 viewedAt: new Date(),
-                userAgent,
-                ipAddress,
-                referrer,
+                userAgent: req.headers["user-agent"],
+                ipAddress: req.ip,
+                referrer: req.headers.referer,
               },
             },
           },
           {
             returnDocument: "after",
-            projection: {
-              views: 1,
-              title: 1,
-            },
+            projection: { views: 1, title: 1 },
           }
         );
 
@@ -1095,12 +1271,9 @@ async function run() {
 
         res.json({
           success: true,
-          message: "View counted successfully",
-          newViewCount: result.value.views,
-          blogTitle: result.value.title,
+          views: result.value.views,
         });
       } catch (error) {
-        console.error("Error tracking view:", error);
         res.status(500).json({
           success: false,
           message: "Failed to track view",
@@ -1109,10 +1282,17 @@ async function run() {
       }
     });
 
-    // Delete blog (Admin only)
+    // Delete blog
     app.delete("/api/blogs/:id", async (req, res) => {
       try {
-        const result = await db.collection("blogs").deleteOne({
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
+        const result = await blogsCollection.deleteOne({
           _id: new ObjectId(req.params.id),
         });
 
@@ -1135,6 +1315,153 @@ async function run() {
         });
       }
     });
+
+    // Add comment to blog
+    app.post("/api/blogs/:id/comments", async (req, res) => {
+      try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
+        const { content, authorId } = req.body;
+
+        if (!content || !authorId) {
+          return res.status(400).json({
+            success: false,
+            message: "Content and authorId are required",
+          });
+        }
+
+        // Get author info
+        const author = await usersCollection.findOne({
+          _id: new ObjectId(authorId),
+        });
+
+        if (!author) {
+          return res.status(400).json({
+            success: false,
+            message: "Author not found",
+          });
+        }
+
+        const newComment = {
+          _id: new ObjectId(),
+          content,
+          author: {
+            id: new ObjectId(authorId),
+            name: author.name,
+            avatar: author.avatar,
+          },
+          likes: [],
+          createdAt: new Date(),
+        };
+
+        const result = await blogsCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $push: { comments: newComment } }
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        res.status(201).json({
+          success: true,
+          data: newComment,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Failed to add comment",
+          error: error.message,
+        });
+      }
+    });
+
+    // Like/unlike comment
+    app.patch("/api/comments/:id/like", async (req, res) => {
+      try {
+        if (
+          !ObjectId.isValid(req.params.id) ||
+          !ObjectId.isValid(req.body.userId)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid ID format",
+          });
+        }
+
+        const commentId = new ObjectId(req.params.id);
+        const userId = new ObjectId(req.body.userId);
+
+        // Find the blog containing the comment
+        const blog = await blogsCollection.findOne({
+          "comments._id": commentId,
+        });
+
+        if (!blog) {
+          return res.status(404).json({
+            success: false,
+            message: "Comment not found",
+          });
+        }
+
+        // Find the comment and update likes
+        const comment = blog.comments.find((c) => c._id.equals(commentId));
+        const likeIndex = comment.likes.findIndex((id) => id.equals(userId));
+
+        let update;
+        let isLiked;
+
+        if (likeIndex === -1) {
+          // Add like
+          update = { $push: { "comments.$[elem].likes": userId } };
+          isLiked = true;
+        } else {
+          // Remove like
+          update = { $pull: { "comments.$[elem].likes": userId } };
+          isLiked = false;
+        }
+
+        const result = await blogsCollection.updateOne(
+          { _id: blog._id, "comments._id": commentId },
+          update,
+          { arrayFilters: [{ "elem._id": commentId }] }
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Failed to update like status",
+          });
+        }
+
+        // Get updated likes count
+        const updatedBlog = await blogsCollection.findOne({ _id: blog._id });
+        const updatedComment = updatedBlog.comments.find((c) =>
+          c._id.equals(commentId)
+        );
+
+        res.json({
+          success: true,
+          likes: updatedComment.likes,
+          isLiked,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Failed to update comment like",
+          error: error.message,
+        });
+      }
+    });
+
     console.log("✅ MongoDB Connected");
   } catch (err) {
     console.error("❌ DB connection error:", err);
