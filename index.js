@@ -378,48 +378,9 @@ async function run() {
     });
 
     // ==============================
-    // GET specific user by email (self or admin)
-    // ==============================
-    app.get("/api/users/:email", verifyJWT, async (req, res) => {
-      const requestedEmail = req.params.email;
-      const decodedEmail = req.decoded?.email;
-
-      try {
-        const requestingUser = await usersCollection.findOne({
-          email: { $regex: new RegExp(`^${decodedEmail}$`, "i") },
-        });
-
-        if (!requestingUser) {
-          return res.status(404).json({ message: "Requesting user not found" });
-        }
-
-        if (
-          requestingUser.role !== "admin" &&
-          decodedEmail !== requestedEmail
-        ) {
-          return res.status(403).json({
-            message: "Access denied. You can only access your own data.",
-          });
-        }
-
-        const targetUser = await usersCollection.findOne({
-          email: { $regex: new RegExp(`^${requestedEmail}$`, "i") },
-        });
-
-        if (!targetUser) {
-          return res.status(404).json({ message: "User not found" });
-        }
-
-        res.status(200).json(targetUser);
-      } catch (error) {
-        res.status(500).json({ message: "Failed to fetch user", error });
-      }
-    });
-
-    // ==============================
     // CHECK admin status of current user
     // ==============================
-    app.get("/api/users/check-admin", verifyJWT, async (req, res) => {
+    app.get("/api/user/check-admin", verifyJWT, async (req, res) => {
       try {
         const email = req.decoded?.email;
 
@@ -468,7 +429,44 @@ async function run() {
         });
       }
     });
+    // ==============================
+    // GET specific user by email (self or admin)
+    // ==============================
+    app.get("/api/users/:email", verifyJWT, async (req, res) => {
+      const requestedEmail = req.params.email;
+      const decodedEmail = req.decoded?.email;
 
+      try {
+        const requestingUser = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${decodedEmail}$`, "i") },
+        });
+
+        if (!requestingUser) {
+          return res.status(404).json({ message: "Requesting user not found" });
+        }
+
+        if (
+          requestingUser.role !== "admin" &&
+          decodedEmail !== requestedEmail
+        ) {
+          return res.status(403).json({
+            message: "Access denied. You can only access your own data.",
+          });
+        }
+
+        const targetUser = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${requestedEmail}$`, "i") },
+        });
+
+        if (!targetUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json(targetUser);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch user", error });
+      }
+    });
     // ==============================
     // POST create user
     // ==============================
@@ -957,19 +955,27 @@ async function run() {
     app.get("/api/blogs", async (req, res) => {
       try {
         const {
-          status = "published",
-          search,
+          status = "published", // can be "published", "draft", or "all"
+          search = "",
           authorId,
           page = 1,
           limit = 10,
           sort = "-createdAt",
         } = req.query;
 
-        const filter = { status };
+        const numericPage = parseInt(page);
+        const numericLimit = parseInt(limit);
 
-        // Author filter
+        const filter = {};
+
+        // Status filter
+        if (status !== "all") {
+          filter.status = status;
+        }
+
+        // AuthorId filter (string UID, not ObjectId)
         if (authorId) {
-          filter.authorId = new ObjectId(authorId);
+          filter.authorId = authorId;
         }
 
         // Search filter
@@ -990,35 +996,39 @@ async function run() {
         }
 
         // Pagination
-        const skip = (page - 1) * limit;
-        const totalBlogs = await blogsCollection.countDocuments(filter);
-        const totalPages = Math.ceil(totalBlogs / limit);
+        const skip = (numericPage - 1) * numericLimit;
 
         // Projection
         const projection = {
+          _id: 1,
           title: 1,
-          author: 1,
           thumbnail: 1,
+          slug: 1,
           status: 1,
           views: 1,
+          author: 1,
+          authorImage: 1,
+          authorEmail: 1,
           createdAt: 1,
-          slug: 1,
-          _id: 1,
         };
+
+        // Count and fetch
+        const totalBlogs = await blogsCollection.countDocuments(filter);
+        const totalPages = Math.ceil(totalBlogs / numericLimit);
 
         const blogs = await blogsCollection
           .find(filter)
+          .project(projection)
           .sort(sortOption)
           .skip(skip)
-          .limit(parseInt(limit))
-          .project(projection)
+          .limit(numericLimit)
           .toArray();
 
         res.json({
           success: true,
           count: blogs.length,
           total: totalBlogs,
-          page: parseInt(page),
+          page: numericPage,
           totalPages,
           data: blogs,
         });
@@ -1041,7 +1051,6 @@ async function run() {
             message: "Invalid blog ID",
           });
         }
-
         const blog = await blogsCollection.findOne({
           _id: new ObjectId(req.params.id),
         });
@@ -1069,48 +1078,56 @@ async function run() {
     // Create new blog
     app.post("/api/blogs", async (req, res) => {
       try {
-        const { title, content, thumbnail, authorId } = req.body;
+        const { title, content, thumbnail, authorId, authorImage, slug } =
+          req.body;
 
-        if (!title || !content || !thumbnail || !authorId) {
+        // ✅ Validate required fields
+        if (
+          !title ||
+          !content ||
+          !thumbnail ||
+          !authorId ||
+          !slug ||
+          !authorImage
+        ) {
           return res.status(400).json({
             success: false,
-            message: "Title, content, thumbnail and authorId are required",
+            message:
+              "Title, content, thumbnail, slug, and authorId are required",
           });
         }
 
-        // Get author info
+        // ✅ Find user by Firebase UID
         const author = await usersCollection.findOne({
-          _id: new ObjectId(authorId),
+          firebaseUid: authorId,
         });
 
         if (!author) {
-          return res.status(400).json({
+          return res.status(404).json({
             success: false,
             message: "Author not found",
           });
         }
 
-        const slug = title
-          .toLowerCase()
-          .replace(/[^\w\s]/gi, "")
-          .replace(/\s+/g, "-");
-
+        // ✅ Create blog object
         const newBlog = {
           title,
           content,
           thumbnail,
-          author: author.name,
-          authorId: new ObjectId(authorId),
-          authorEmail: author.email,
+          slug,
+          authorImage,
+          author: author.name || "Anonymous",
+          authorId: author.firebaseUid,
+          authorEmail: author.email || "unknown@example.com",
           status: "draft",
           views: 0,
           comments: [],
           likes: [],
           createdAt: new Date(),
           updatedAt: new Date(),
-          slug,
         };
 
+        // ✅ Save to DB
         const result = await blogsCollection.insertOne(newBlog);
 
         res.status(201).json({
@@ -1121,6 +1138,7 @@ async function run() {
           },
         });
       } catch (error) {
+        console.error("Error creating blog:", error);
         res.status(500).json({
           success: false,
           message: "Server error creating blog",
@@ -1236,23 +1254,49 @@ async function run() {
     // Track blog view
     app.patch("/api/blogs/:id/views", async (req, res) => {
       try {
-        if (!ObjectId.isValid(req.params.id)) {
+        const { id } = req.params;
+
+        // Validate ID format first
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid blog ID",
+            message: "Invalid blog ID format",
           });
         }
 
-        const result = await blogsCollection.findOneAndUpdate(
-          { _id: new ObjectId(req.params.id) },
+        const blogId = new ObjectId(id);
+        const ip = req.ip;
+        const userAgent = req.headers["user-agent"] || "unknown";
+        const referrer = req.headers.referer || "direct";
+
+        // Check for recent view from this IP (prevent refresh spam)
+        const oneHourAgo = new Date(Date.now() - 3600000);
+        const existingView = await blogsCollection.findOne({
+          _id: blogId,
+          "viewDetails.ipAddress": ip,
+          "viewDetails.viewedAt": { $gt: oneHourAgo },
+        });
+
+        if (existingView) {
+          return res.json({
+            success: true,
+            views: existingView.views,
+            message: "View already recorded recently",
+          });
+        }
+
+        // Atomic update with view tracking
+        const updateResult = await blogsCollection.findOneAndUpdate(
+          { _id: blogId },
           {
             $inc: { views: 1 },
             $push: {
               viewDetails: {
                 viewedAt: new Date(),
-                userAgent: req.headers["user-agent"],
-                ipAddress: req.ip,
-                referrer: req.headers.referer,
+                userAgent,
+                ipAddress: ip,
+                referrer,
+                sessionId: req.sessionID || null,
               },
             },
           },
@@ -1262,7 +1306,7 @@ async function run() {
           }
         );
 
-        if (!result.value) {
+        if (!updateResult.value) {
           return res.status(404).json({
             success: false,
             message: "Blog not found",
@@ -1271,13 +1315,15 @@ async function run() {
 
         res.json({
           success: true,
-          views: result.value.views,
+          views: updateResult.value.views,
         });
       } catch (error) {
+        console.error("View tracking error:", error);
         res.status(500).json({
           success: false,
-          message: "Failed to track view",
-          error: error.message,
+          message: "Internal server error",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
