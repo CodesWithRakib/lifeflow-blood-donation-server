@@ -138,100 +138,261 @@ async function run() {
     });
 
     // ====== FUNDING ROUTES ======
-    // Get paginated funding records
     app.get("/api/funds", async (req, res) => {
+      // Validate and parse pagination parameters
+      const page = Math.max(1, parseInt(req.query.page)) || 1;
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit))) || 10;
+
       try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
 
-        const total = await fundingCollection.countDocuments();
-        const funds = await fundingCollection
-          .find()
-          .sort({ date: -1 })
-          .skip(skip)
-          .limit(limit)
-          .toArray();
+        // Execute all queries in parallel for maximum performance
+        const [totalRecords, records, totalStats, recentDonation] =
+          await Promise.all([
+            fundingCollection.countDocuments(),
+            fundingCollection
+              .find()
+              .sort({ createdAt: -1 })
+              .skip(skip)
+              .limit(limit)
+              .toArray(),
+            fundingCollection
+              .aggregate([
+                {
+                  $group: {
+                    _id: null,
+                    totalFunds: { $sum: "$amount" },
+                    uniqueDonors: { $addToSet: "$userEmail" },
+                  },
+                },
+              ])
+              .toArray(),
+            fundingCollection.findOne(
+              {},
+              {
+                sort: { createdAt: -1 },
+                projection: { amount: 1 },
+              }
+            ),
+          ]);
 
-        res.status(200).json({
-          data: funds,
-          pagination: {
-            page,
-            limit,
-            total,
-            totalPages: Math.ceil(total / limit),
+        // Extract stats from aggregation results
+        const statsResult = totalStats[0] || {};
+
+        // Prepare complete response
+        const response = {
+          success: true,
+          data: records,
+          stats: {
+            totalFunds: statsResult.totalFunds || 0,
+            totalDonors: statsResult.uniqueDonors?.length || 0,
+            recentAmount: recentDonation?.amount || 0,
           },
-        });
+          pagination: {
+            currentPage: page,
+            itemsPerPage: limit,
+            totalItems: totalRecords,
+            totalPages: Math.ceil(totalRecords / limit),
+            hasNextPage: page * limit < totalRecords,
+          },
+        };
+
+        res.status(200).json(response);
       } catch (error) {
-        console.error("GET /api/funds error:", error);
-        res.status(500).json({ message: "Failed to fetch funding records" });
+        console.error("[GET /api/funds] Error:", error);
+
+        res.status(500).json({
+          success: false,
+          message: "Failed to retrieve funding records",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
-    // Get funding statistics
     app.get("/api/funds/stats", async (req, res) => {
       try {
-        const totalAgg = await fundingCollection
-          .aggregate([
-            {
-              $group: {
-                _id: null,
-                totalFunds: { $sum: "$amount" },
-                totalDonors: { $addToSet: "$email" },
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+        const [totalStats, recentStats, weeklyStats] = await Promise.all([
+          fundingCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: null,
+                  totalFunds: { $sum: "$amount" },
+                  uniqueDonors: { $addToSet: "$userEmail" },
+                  count: { $sum: 1 },
+                  avgAmount: { $avg: "$amount" },
+                },
               },
+            ])
+            .toArray(),
+          fundingCollection.findOne(
+            {},
+            {
+              sort: { createdAt: -1 },
+              projection: {
+                amount: 1,
+                userEmail: 1,
+                userName: 1,
+                createdAt: 1,
+              },
+            }
+          ),
+          fundingCollection
+            .aggregate([
+              {
+                $match: {
+                  createdAt: { $gte: oneWeekAgo },
+                },
+              },
+              {
+                $group: {
+                  _id: null,
+                  weeklyTotal: { $sum: "$amount" },
+                  weeklyDonors: { $addToSet: "$userEmail" },
+                  weeklyCount: { $sum: 1 },
+                },
+              },
+            ])
+            .toArray(),
+        ]);
+
+        const stats = totalStats[0] || {};
+        const weekly = weeklyStats[0] || {};
+
+        res.status(200).json({
+          success: true,
+          data: {
+            // Summary stats
+            totalFunds: stats.totalFunds || 0,
+            totalDonors: stats.uniqueDonors?.length || 0,
+            totalDonations: stats.count || 0,
+            avgDonation: stats.avgAmount ? stats.avgAmount.toFixed(2) : 0,
+
+            // Recent activity
+            recentDonation: {
+              amount: recentStats?.amount || 0,
+              donorEmail: recentStats?.userEmail || null,
+              donorName: recentStats?.userName || null,
+              date: recentStats?.createdAt || null,
             },
-          ])
-          .toArray();
-        const recent = await fundingCollection.findOne(
-          {},
-          { sort: { date: -1 } }
-        );
-        const stats = {
-          totalFunds: totalAgg[0]?.totalFunds || 0,
-          totalDonors: totalAgg[0]?.totalDonors.length || 0,
-          recentAmount: recent?.amount || 0,
-        };
-        res.status(200).json(stats);
-      } catch (err) {
-        console.error("GET /api/funds/stats error:", err);
-        res.status(500).json({ message: "Failed to fetch stats" });
+
+            // Weekly trends
+            weeklyTotal: weekly.weeklyTotal || 0,
+            weeklyDonors: weekly.weeklyDonors?.length || 0,
+            weeklyDonations: weekly.weeklyCount || 0,
+
+            // Currency info
+            primaryCurrency: "usd", // Could be dynamic if you support multiple currencies
+          },
+        });
+      } catch (error) {
+        console.error("[GET /api/funds/stats] Error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch funding statistics",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
     app.post("/api/funds", async (req, res) => {
-      const { userEmail, userName, amount, currency, paymentIntentId } =
-        req.body;
+      // Validate required fields
+      const {
+        userEmail,
+        userName,
+        amount,
+        currency,
+        paymentIntentId,
+        metadata,
+      } = req.body;
 
       if (!userEmail || !amount || !paymentIntentId) {
-        return res
-          .status(400)
-          .json({ message: "Missing required donation data" });
+        return res.status(400).json({
+          success: false,
+          message:
+            "Missing required fields: userEmail, amount, and paymentIntentId are required",
+          requiredFields: {
+            userEmail: "string",
+            amount: "number",
+            paymentIntentId: "string",
+          },
+        });
+      }
+
+      // Validate amount is a positive number
+      if (isNaN(amount) || amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Amount must be a positive number",
+          received: amount,
+        });
       }
 
       try {
+        // Check for duplicate payment intent
+        const existingDonation = await fundingCollection.findOne({
+          paymentIntentId,
+        });
+        if (existingDonation) {
+          return res.status(409).json({
+            success: false,
+            message: "Donation with this payment intent already exists",
+            donationId: existingDonation._id,
+          });
+        }
+
+        // Create donation document
         const donation = {
           userEmail,
-          userName,
-          amount,
+          userName: userName || "Anonymous Donor",
+          amount: parseFloat(amount),
           currency: currency || "usd",
           paymentIntentId,
           status: "succeeded",
+          metadata: metadata || {},
           createdAt: new Date(),
+          updatedAt: new Date(),
+          // Additional useful fields
+          isAnonymous: !!metadata?.isAnonymous,
+          campaign: metadata?.campaign || "general",
+          receiptSent: false,
         };
 
+        // Insert into database
         const result = await fundingCollection.insertOne(donation);
 
+        // In a real application, you might want to:
+        // 1. Send a receipt email
+        // 2. Update donor statistics
+        // 3. Trigger any post-donation workflows
+
         res.status(201).json({
-          message: "Donation saved successfully",
-          donationId: result.insertedId,
+          success: true,
+          message: "Donation recorded successfully",
+          data: {
+            donationId: result.insertedId,
+            amount: donation.amount,
+            currency: donation.currency,
+            donorEmail: donation.isAnonymous ? null : donation.userEmail,
+          },
         });
-      } catch (err) {
-        console.error("Error saving donation:", err);
-        res.status(500).json({ message: "Failed to save donation" });
+      } catch (error) {
+        console.error("[POST /api/funds] Error:", error);
+
+        res.status(500).json({
+          success: false,
+          message: "Failed to process donation",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+          retrySuggestion: "Please verify the payment intent and try again",
+        });
       }
     });
-
-    // Create Stripe Payment Intent
     app.post("/api/payments/create-intent", async (req, res) => {
       const { amount, currency = "usd" } = req.body;
       if (!amount || amount < 1)
@@ -432,7 +593,7 @@ async function run() {
     // ==============================
     // GET specific user by email (self or admin)
     // ==============================
-    app.get("/api/users/:email", verifyJWT, async (req, res) => {
+    app.get("/api/user/:email", verifyJWT, async (req, res) => {
       const requestedEmail = req.params.email;
       const decodedEmail = req.decoded?.email;
 
@@ -462,7 +623,10 @@ async function run() {
           return res.status(404).json({ message: "User not found" });
         }
 
-        res.status(200).json(targetUser);
+        res.status(200).json({
+          success: true,
+          data: targetUser,
+        });
       } catch (error) {
         res.status(500).json({ message: "Failed to fetch user", error });
       }
@@ -553,7 +717,7 @@ async function run() {
     // ==============================
     // PATCH update user by email
     // ==============================
-    app.patch("/api/users/:email", async (req, res) => {
+    app.patch("/api/user/:email", async (req, res) => {
       const { email } = req.params;
       const updates = req.body;
 
@@ -578,7 +742,7 @@ async function run() {
     // ==============================
     // DELETE user by MongoDB ID
     // ==============================
-    app.delete("/api/users/:id", async (req, res) => {
+    app.delete("/api/user/:id", async (req, res) => {
       const { id } = req.params;
 
       if (!ObjectId.isValid(id)) {
@@ -603,7 +767,7 @@ async function run() {
     // ==============================
     // PATCH update user status
     // ==============================
-    app.patch("/api/users/status/:id", async (req, res) => {
+    app.patch("/api/user/status/:id", async (req, res) => {
       const { status } = req.body;
       const { id } = req.params;
 
@@ -636,7 +800,7 @@ async function run() {
     // ==============================
     // PATCH update user role
     // ==============================
-    app.patch("/api/users/role/:id", async (req, res) => {
+    app.patch("/api/user/role/:id", async (req, res) => {
       const { role } = req.body;
       const { id } = req.params;
 
@@ -741,18 +905,33 @@ async function run() {
           .json({ success: false, error: "Internal server error" });
       }
     });
-
-    // GET recent 3 donation requests (sorted by date descending)
-    app.get("/api/donation-requests/recent", async (req, res) => {
+    // get all donation requests by email
+    app.get("/api/donation-requests/:email", async (req, res) => {
       try {
-        const recentRequests = await donationRequestCollection
-          .find()
-          .sort({ date: -1 })
+        const email = req.params.email;
+        const requests = await donationRequestCollection
+          .find({ requesterEmail: email })
+          .toArray();
+        res.json({ success: true, data: requests });
+      } catch (error) {
+        console.error("Error fetching donation requests:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
+    });
+    // GET recent 3 donation requests (sorted by date descending)
+    app.get("/api/donation-requests/recent/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const requests = await donationRequestCollection
+          .find({ requesterEmail: email })
+          .sort({ createdAt: -1 })
           .limit(3)
           .toArray();
-        res.json({ success: true, data: recentRequests });
+        res.json({ success: true, data: requests });
       } catch (error) {
-        console.error("Error fetching recent requests:", error);
+        console.error("Error fetching donation requests:", error);
         res
           .status(500)
           .json({ success: false, error: "Internal server error" });
@@ -955,7 +1134,7 @@ async function run() {
     app.get("/api/blogs", async (req, res) => {
       try {
         const {
-          status = "published", // can be "published", "draft", or "all"
+          status = "published",
           search = "",
           authorId,
           page = 1,
@@ -968,17 +1147,25 @@ async function run() {
 
         const filter = {};
 
-        // Status filter
-        if (status !== "all") {
+        // ✅ Restrict to only 'draft' and 'published'
+        if (status === "all") {
+          filter.status = { $in: ["draft", "published"] };
+        } else if (["draft", "published"].includes(status)) {
           filter.status = status;
+        } else {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Invalid status filter. Must be 'draft', 'published', or 'all'.",
+          });
         }
 
-        // AuthorId filter (string UID, not ObjectId)
+        // ✅ Filter by authorId if present
         if (authorId) {
           filter.authorId = authorId;
         }
 
-        // Search filter
+        // ✅ Full-text search on title, content, or author
         if (search) {
           filter.$or = [
             { title: { $regex: search, $options: "i" } },
@@ -987,7 +1174,7 @@ async function run() {
           ];
         }
 
-        // Sort option
+        // ✅ Sorting
         const sortOption = {};
         if (sort.startsWith("-")) {
           sortOption[sort.substring(1)] = -1;
@@ -995,10 +1182,10 @@ async function run() {
           sortOption[sort] = 1;
         }
 
-        // Pagination
+        // ✅ Pagination calculation
         const skip = (numericPage - 1) * numericLimit;
 
-        // Projection
+        // ✅ Only send needed fields
         const projection = {
           _id: 1,
           title: 1,
@@ -1010,9 +1197,9 @@ async function run() {
           authorImage: 1,
           authorEmail: 1,
           createdAt: 1,
+          content: 1, // Add if content snippet is needed in frontend preview
         };
 
-        // Count and fetch
         const totalBlogs = await blogsCollection.countDocuments(filter);
         const totalPages = Math.ceil(totalBlogs / numericLimit);
 
