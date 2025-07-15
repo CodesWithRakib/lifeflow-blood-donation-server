@@ -8,11 +8,14 @@ const jwt = require("jsonwebtoken");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-const port = process.env.PORT || 5000;
+// const port = process.env.PORT || 5000;
 
 // ====== Middleware Setup ======
 const corsOptions = {
-  origin: ["http://localhost:5173"], // you can allow multiple origins if needed
+  origin: [
+    "http://localhost:5173",
+    "https://blood-donation-full-stack.web.app",
+  ], // you can allow multiple origins if needed
   credentials: true,
   methods: ["GET", "POST", "PATCH", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -43,6 +46,7 @@ const verifyJWT = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
     req.decoded = decoded;
+    req.userEmail = decoded.email;
     next();
   } catch (error) {
     return res
@@ -82,9 +86,28 @@ let usersCollection,
 const allowedStatuses = ["active", "blocked", "inactive"];
 const allowedRoles = ["donor", "volunteer", "admin"];
 
+// Helper functions
+function getBrowser(userAgent) {
+  // Implement browser detection logic
+  if (/edg/i.test(userAgent)) return "Edge";
+  if (/chrome/i.test(userAgent)) return "Chrome";
+  if (/firefox/i.test(userAgent)) return "Firefox";
+  if (/safari/i.test(userAgent)) return "Safari";
+  return "Other";
+}
+
+function getOS(userAgent) {
+  // Implement OS detection logic
+  if (/windows/i.test(userAgent)) return "Windows";
+  if (/macintosh/i.test(userAgent)) return "MacOS";
+  if (/linux/i.test(userAgent)) return "Linux";
+  if (/android/i.test(userAgent)) return "Android";
+  if (/iphone|ipad|ipod/i.test(userAgent)) return "iOS";
+  return "Unknown";
+}
+
 async function run() {
   try {
-    await client.connect();
     const db = client.db("bloodDonationApp");
     usersCollection = db.collection("users");
     donationRequestCollection = db.collection("donationRequest");
@@ -92,7 +115,7 @@ async function run() {
     blogsCollection = db.collection("blogs");
 
     // ====== AUTH ROUTES ======
-    app.post("/jwt", (req, res) => {
+    app.post("/api/jwt", (req, res) => {
       const { email } = req.body;
       if (!email) return res.status(400).json({ message: "Email required" });
 
@@ -110,31 +133,14 @@ async function run() {
         .json({ message: "JWT set", token });
     });
 
-    // ====== Stripe Checkout Session (Optional) ======
-    app.post("/create-checkout-session", async (req, res) => {
-      const { amount } = req.body;
-      try {
-        const session = await stripe.checkout.sessions.create({
-          payment_method_types: ["card"],
-          line_items: [
-            {
-              price_data: {
-                currency: "bdt",
-                product_data: { name: "Fund Donation" },
-                unit_amount: amount * 100,
-              },
-              quantity: 1,
-            },
-          ],
-          mode: "payment",
-          success_url: `${process.env.CLIENT_URL}/funding?success=true`,
-          cancel_url: `${process.env.CLIENT_URL}/funding?canceled=true`,
-        });
-        res.json({ url: session.url });
-      } catch (error) {
-        console.error("Stripe Checkout Error:", error);
-        res.status(500).json({ error: "Unable to create checkout session" });
-      }
+    app.post("/api/logout", (req, res) => {
+      res
+        .clearCookie("jwt", {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === "production", // ✅ HTTPS-only in prod
+          sameSite: process.env.NODE_ENV === "production" ? "none" : "strict", // ✅ CORS-safe
+        })
+        .json({ message: "Logout successful" });
     });
 
     // ====== FUNDING ROUTES ======
@@ -215,6 +221,7 @@ async function run() {
         const oneWeekAgo = new Date();
         oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
 
+        // Fetch overall stats, recent donation, and weekly day-wise trend
         const [totalStats, recentStats, weeklyStats] = await Promise.all([
           fundingCollection
             .aggregate([
@@ -250,18 +257,18 @@ async function run() {
               },
               {
                 $group: {
-                  _id: null,
-                  weeklyTotal: { $sum: "$amount" },
-                  weeklyDonors: { $addToSet: "$userEmail" },
-                  weeklyCount: { $sum: 1 },
+                  _id: {
+                    $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+                  },
+                  total: { $sum: "$amount" },
                 },
               },
+              { $sort: { _id: 1 } },
             ])
             .toArray(),
         ]);
 
         const stats = totalStats[0] || {};
-        const weekly = weeklyStats[0] || {};
 
         res.status(200).json({
           success: true,
@@ -280,13 +287,19 @@ async function run() {
               date: recentStats?.createdAt || null,
             },
 
-            // Weekly trends
-            weeklyTotal: weekly.weeklyTotal || 0,
-            weeklyDonors: weekly.weeklyDonors?.length || 0,
-            weeklyDonations: weekly.weeklyCount || 0,
+            // Weekly totals
+            weeklyTotal: weeklyStats.reduce((sum, item) => sum + item.total, 0),
+            weeklyDonors:
+              new Set(weeklyStats.flatMap((item) => item.userEmail)).size || 0,
+            weeklyDonations: weeklyStats.length,
 
-            // Currency info
-            primaryCurrency: "usd", // Could be dynamic if you support multiple currencies
+            // Trend chart data
+            weeklyTrends: weeklyStats.map((entry) => ({
+              date: entry._id, // e.g., "2025-07-08"
+              total: entry.total, // Total amount donated that day
+            })),
+
+            primaryCurrency: "usd",
           },
         });
       } catch (error) {
@@ -300,36 +313,92 @@ async function run() {
       }
     });
 
+    // Create payment intent endpoint
+    app.post("/api/payments/create-intent", async (req, res) => {
+      const { amount, currency = "usd" } = req.body;
+
+      // Validate amount
+      if (!amount || isNaN(amount)) {
+        return res.status(400).json({
+          success: false,
+          message: "Amount must be a valid number",
+        });
+      }
+
+      const numericAmount = parseFloat(amount);
+      if (numericAmount < 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Minimum donation amount is $1",
+        });
+      }
+
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(numericAmount * 100), // Convert to cents
+          currency,
+          automatic_payment_methods: { enabled: true },
+          metadata: {
+            initiated_by: req.user?.email || "anonymous",
+            purpose: "donation",
+          },
+        });
+
+        res.json({
+          success: true,
+          clientSecret: paymentIntent.client_secret,
+        });
+      } catch (error) {
+        console.error("Stripe intent error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to create payment intent",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
+
+    // Record donation endpoint
     app.post("/api/funds", async (req, res) => {
-      // Validate required fields
       const {
         userEmail,
         userName,
         amount,
-        currency,
+        currency = "usd",
         paymentIntentId,
-        metadata,
+        status = "succeeded",
+        metadata = {},
       } = req.body;
 
+      // Validate required fields
       if (!userEmail || !amount || !paymentIntentId) {
         return res.status(400).json({
           success: false,
-          message:
-            "Missing required fields: userEmail, amount, and paymentIntentId are required",
-          requiredFields: {
+          message: "Missing required fields",
+          required: {
             userEmail: "string",
-            amount: "number",
+            amount: "number > 0",
             paymentIntentId: "string",
           },
         });
       }
 
-      // Validate amount is a positive number
-      if (isNaN(amount) || amount <= 0) {
+      // Validate amount
+      const numericAmount = parseFloat(amount);
+      if (isNaN(numericAmount)) {
         return res.status(400).json({
           success: false,
-          message: "Amount must be a positive number",
+          message: "Amount must be a valid number",
           received: amount,
+        });
+      }
+
+      if (numericAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Amount must be greater than 0",
+          received: numericAmount,
         });
       }
 
@@ -339,10 +408,13 @@ async function run() {
           paymentIntentId,
         });
         if (existingDonation) {
-          return res.status(409).json({
-            success: false,
-            message: "Donation with this payment intent already exists",
-            donationId: existingDonation._id,
+          return res.status(200).json({
+            success: true,
+            message: "Donation already recorded",
+            data: {
+              donationId: existingDonation._id,
+              amount: existingDonation.amount,
+            },
           });
         }
 
@@ -350,25 +422,26 @@ async function run() {
         const donation = {
           userEmail,
           userName: userName || "Anonymous Donor",
-          amount: parseFloat(amount),
-          currency: currency || "usd",
+          amount: numericAmount,
+          currency,
           paymentIntentId,
-          status: "succeeded",
-          metadata: metadata || {},
+          status,
+          metadata: {
+            isAnonymous: !!metadata?.isAnonymous,
+            campaign: metadata?.campaign || "general",
+            ...metadata,
+          },
           createdAt: new Date(),
           updatedAt: new Date(),
-          // Additional useful fields
-          isAnonymous: !!metadata?.isAnonymous,
-          campaign: metadata?.campaign || "general",
           receiptSent: false,
         };
 
         // Insert into database
         const result = await fundingCollection.insertOne(donation);
 
-        // In a real application, you might want to:
-        // 1. Send a receipt email
-        // 2. Update donor statistics
+        // In production, you might want to:
+        // 1. Send receipt email
+        // 2. Update analytics
         // 3. Trigger any post-donation workflows
 
         res.status(201).json({
@@ -378,35 +451,17 @@ async function run() {
             donationId: result.insertedId,
             amount: donation.amount,
             currency: donation.currency,
-            donorEmail: donation.isAnonymous ? null : donation.userEmail,
+            donor: donation.isAnonymous ? "Anonymous" : donation.userName,
           },
         });
       } catch (error) {
         console.error("[POST /api/funds] Error:", error);
-
         res.status(500).json({
           success: false,
-          message: "Failed to process donation",
+          message: "Internal server error",
           error:
             process.env.NODE_ENV === "development" ? error.message : undefined,
-          retrySuggestion: "Please verify the payment intent and try again",
         });
-      }
-    });
-    app.post("/api/payments/create-intent", async (req, res) => {
-      const { amount, currency = "usd" } = req.body;
-      if (!amount || amount < 1)
-        return res.status(400).json({ message: "Invalid donation amount" });
-      try {
-        const paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(amount * 100),
-          currency,
-          automatic_payment_methods: { enabled: true },
-        });
-        res.json({ clientSecret: paymentIntent.client_secret });
-      } catch (error) {
-        console.error("Stripe intent error:", error);
-        res.status(500).json({ message: "Failed to create payment intent" });
       }
     });
     // ====== SEARCH DONORS ENDPOINT ======
@@ -483,6 +538,18 @@ async function run() {
     app.get("/api/users", verifyJWT, async (req, res) => {
       try {
         const email = req.decoded?.email;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        // Validate inputs
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
+        if (isNaN(pageNum) || isNaN(limitNum)) {
+          return res
+            .status(400)
+            .json({ message: "Invalid pagination parameters" });
+        }
+
+        // Check admin privileges
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${email}$`, "i") },
         });
@@ -491,10 +558,37 @@ async function run() {
           return res.status(403).json({ message: "Forbidden: Admins only." });
         }
 
-        const users = await usersCollection.find({}).toArray();
-        res.status(200).json(users);
+        // Build query filter
+        const filter = {};
+        if (status) {
+          filter.status = status;
+        }
+
+        // Get paginated users
+        const users = await usersCollection
+          .find(filter)
+          .sort({ createdAt: -1 }) // or any other field you want to sort by
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .toArray();
+
+        // Get total count for pagination info
+        const totalCount = await usersCollection.countDocuments(filter);
+
+        res.status(200).json({
+          users,
+          pagination: {
+            total: totalCount,
+            page: pageNum,
+            limit: limitNum,
+            totalPages: Math.ceil(totalCount / limitNum),
+          },
+        });
       } catch (error) {
-        res.status(500).json({ message: "Failed to fetch users", error });
+        console.error("Failed to fetch users:", error);
+        res
+          .status(500)
+          .json({ message: "Failed to fetch users", error: error.message });
       }
     });
 
@@ -673,7 +767,7 @@ async function run() {
             success: true,
             message: "User already exists",
             data: {
-              userId: existingUser._id,
+              authorId: existingUser._id,
               email: existingUser.email,
             },
           });
@@ -767,7 +861,7 @@ async function run() {
     // ==============================
     // PATCH update user status
     // ==============================
-    app.patch("/api/user/status/:id", async (req, res) => {
+    app.patch("/api/user/:id/status", async (req, res) => {
       const { status } = req.body;
       const { id } = req.params;
 
@@ -796,11 +890,10 @@ async function run() {
         res.status(500).json({ message: "Status update failed", error });
       }
     });
-
     // ==============================
     // PATCH update user role
     // ==============================
-    app.patch("/api/user/role/:id", async (req, res) => {
+    app.patch("/api/user/:id/role", async (req, res) => {
       const { role } = req.body;
       const { id } = req.params;
 
@@ -831,7 +924,7 @@ async function run() {
     });
 
     // GET all donation requests with filters + pagination
-    app.get("/api/donation-requests", async (req, res) => {
+    app.get("/api/donations", async (req, res) => {
       try {
         const {
           page = 1,
@@ -906,22 +999,47 @@ async function run() {
       }
     });
     // get all donation requests by email
-    app.get("/api/donation-requests/:email", async (req, res) => {
+    app.get("/api/donations/:email/my-requests", async (req, res) => {
       try {
         const email = req.params.email;
-        const requests = await donationRequestCollection
-          .find({ requesterEmail: email })
-          .toArray();
-        res.json({ success: true, data: requests });
+        const { status, page = 1, limit = 10 } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const filter = { requesterEmail: email };
+        if (status && status !== "all") filter.status = status;
+
+        const [requests, totalCount] = await Promise.all([
+          donationRequestCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .toArray(),
+          donationRequestCollection.countDocuments(filter),
+        ]);
+
+        const totalPages = Math.ceil(totalCount / parseInt(limit));
+
+        res.json({
+          success: true,
+          data: requests,
+          pagination: {
+            totalItems: totalCount,
+            totalPages,
+            currentPage: parseInt(page),
+            itemsPerPage: parseInt(limit),
+            hasNext: parseInt(page) < totalPages,
+            hasPrevious: parseInt(page) > 1,
+          },
+        });
       } catch (error) {
-        console.error("Error fetching donation requests:", error);
         res
           .status(500)
           .json({ success: false, error: "Internal server error" });
       }
     });
+
     // GET recent 3 donation requests (sorted by date descending)
-    app.get("/api/donation-requests/recent/:email", async (req, res) => {
+    app.get("/api/donations/recent/:email", async (req, res) => {
       try {
         const email = req.params.email;
         const requests = await donationRequestCollection
@@ -939,15 +1057,21 @@ async function run() {
     });
 
     // GET single donation request by ID
-    app.get("/api/donation-requests/:id", async (req, res) => {
+    app.get("/api/donations/:id", async (req, res) => {
       try {
         const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid ID format" });
+        }
         const query = { _id: new ObjectId(id) };
         const request = await donationRequestCollection.findOne(query);
         if (!request) {
           return res.status(404).json({ success: false, error: "Not found" });
         }
-        res.json(request);
+        res.json({ success: true, data: request });
       } catch (error) {
         console.error("Error fetching request:", error);
         res
@@ -957,14 +1081,14 @@ async function run() {
     });
 
     // POST new donation request
-    app.post("/api/donation-requests", async (req, res) => {
+    app.post("/api/donations", async (req, res) => {
       try {
         const {
           recipientName,
-          district,
-          upazila,
-          hospital,
-          address,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
           bloodGroup,
           date,
           time,
@@ -975,10 +1099,10 @@ async function run() {
 
         const requiredFields = [
           recipientName,
-          district,
-          upazila,
-          hospital,
-          address,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
           bloodGroup,
           date,
           time,
@@ -993,10 +1117,10 @@ async function run() {
 
         const newRequest = {
           recipientName,
-          district,
-          upazila,
-          hospital,
-          address,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
           bloodGroup,
           date,
           time,
@@ -1022,15 +1146,15 @@ async function run() {
       }
     });
 
-    app.patch("/api/donation-requests/:id", async (req, res) => {
+    app.patch("/api/donations/:id", async (req, res) => {
       try {
         const { id } = req.params;
         const {
           recipientName,
-          district,
-          upazila,
-          hospital,
-          address,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
           bloodGroup,
           date,
           time,
@@ -1046,10 +1170,10 @@ async function run() {
 
         const updateData = {
           recipientName,
-          district,
-          upazila,
-          hospital,
-          address,
+          recipientDistrict,
+          recipientUpazila,
+          hospitalName,
+          fullAddress,
           bloodGroup,
           date,
           time,
@@ -1085,23 +1209,27 @@ async function run() {
       }
     });
 
-    // PATCH donation status
-    app.patch("/api/donation-requests/status/:id", async (req, res) => {
+    app.patch("api/donations/donate/:id", async (req, res) => {
       try {
         const { id } = req.params;
-        const { status } = req.body;
-        const validStatuses = ["pending", "inprogress", "done", "canceled"];
+        const { status, donorName, donorEmail } = req.body;
 
-        if (!validStatuses.includes(status)) {
+        if (!ObjectId.isValid(id)) {
           return res
             .status(400)
-            .json({ success: false, error: "Invalid status" });
+            .json({ success: false, error: "Invalid ID format" });
         }
 
         const result = await donationRequestCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status, updatedAt: new Date() } }
+          { $set: { status, updatedAt: new Date(), donorName, donorEmail } }
         );
+
+        if (result.matchedCount === 0) {
+          return res
+            .status(404)
+            .json({ success: false, error: "Request not found" });
+        }
 
         res.json({
           success: result.modifiedCount === 1,
@@ -1118,8 +1246,51 @@ async function run() {
       }
     });
 
+    // Update donation status
+    app.patch("/api/donations/status/:id", verifyJWT, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+        const validStatuses = ["pending", "inprogress", "done", "canceled"];
+
+        if (!validStatuses.includes(status)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid status",
+            validStatuses,
+          });
+        }
+
+        const result = await donationRequestCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            error: "Request not found or no changes made",
+          });
+        }
+
+        res.json({
+          success: true,
+          message: "Status updated successfully",
+          updatedId: id,
+          newStatus: status,
+        });
+      } catch (error) {
+        console.error("Error updating donation status:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message: error.message,
+        });
+      }
+    });
+
     app.delete(
-      "/api/donation-requests/:id",
+      "/api/donations/:id",
       verifyJWT,
       verifyAdmin,
       async (req, res) => {
@@ -1229,7 +1400,6 @@ async function run() {
       }
     });
 
-    // Get single blog
     app.get("/api/blogs/:id", async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
@@ -1389,6 +1559,141 @@ async function run() {
       }
     });
 
+    // Like/unlike a blog
+    app.patch("/api/blogs/:id/like", async (req, res) => {
+      try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+        const { authorId } = req.body;
+        if (!authorId) {
+          return res.status(400).json({
+            success: false,
+            message: "User ID is required",
+          });
+        }
+
+        const blogId = new ObjectId(req.params.id);
+        const blog = await blogsCollection.findOne({ _id: blogId });
+
+        if (!blog) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
+
+        // Check if user already liked the blog
+        const likeIndex = blog.likes.findIndex((id) => id === authorId);
+        let update;
+        let isLiked;
+
+        if (likeIndex === -1) {
+          // Add like
+          update = { $push: { likes: authorId }, $inc: { likesCount: 1 } };
+          isLiked = true;
+        } else {
+          // Remove like
+          update = { $pull: { likes: authorId }, $inc: { likesCount: -1 } };
+          isLiked = false;
+        }
+
+        const result = await blogsCollection.updateOne({ _id: blogId }, update);
+
+        if (result.modifiedCount === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Failed to update like status",
+          });
+        }
+
+        // Get updated likes count
+        const updatedBlog = await blogsCollection.findOne({ _id: blogId });
+
+        res.json({
+          success: true,
+          isLiked,
+          likesCount: updatedBlog.likesCount || updatedBlog.likes.length,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Failed to update blog like",
+          error: error.message,
+        });
+      }
+    });
+
+    // Bookmark/unbookmark a blog
+    app.patch("/api/blogs/:id/bookmark", async (req, res) => {
+      try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid blog ID",
+          });
+        }
+
+        const { authorId } = req.body;
+        if (!authorId) {
+          return res.status(400).json({
+            success: false,
+            message: "User ID is required",
+          });
+        }
+
+        // Find user document
+        const user = await usersCollection.findOne({ firebaseUid: authorId });
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        const blogId = req.params.id;
+        const bookmarkIndex = user.bookmarks?.indexOf(blogId) ?? -1;
+        let update;
+        let isBookmarked;
+
+        if (bookmarkIndex === -1) {
+          // Add bookmark
+          update = { $addToSet: { bookmarks: blogId } };
+          isBookmarked = true;
+        } else {
+          // Remove bookmark
+          update = { $pull: { bookmarks: blogId } };
+          isBookmarked = false;
+        }
+
+        const result = await usersCollection.updateOne(
+          { firebaseUid: authorId },
+          update
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Failed to update bookmark status",
+          });
+        }
+
+        res.json({
+          success: true,
+          isBookmarked,
+        });
+      } catch (error) {
+        res.status(500).json({
+          success: false,
+          message: "Failed to update bookmark",
+          error: error.message,
+        });
+      }
+    });
+
     // Update blog status
     app.patch("/api/blogs/:id/status", async (req, res) => {
       try {
@@ -1452,17 +1757,33 @@ async function run() {
         }
 
         const blogId = new ObjectId(id);
-        const ip = req.ip;
+        const ip = req.ip || req.connection.remoteAddress;
         const userAgent = req.headers["user-agent"] || "unknown";
         const referrer = req.headers.referer || "direct";
+        const now = new Date();
+
+        // Additional check if blog exists
+        const blogExists = await blogsCollection.findOne(
+          { _id: blogId },
+          { projection: { _id: 1 } }
+        );
+        if (!blogExists) {
+          return res.status(404).json({
+            success: false,
+            message: "Blog not found",
+          });
+        }
 
         // Check for recent view from this IP (prevent refresh spam)
-        const oneHourAgo = new Date(Date.now() - 3600000);
-        const existingView = await blogsCollection.findOne({
-          _id: blogId,
-          "viewDetails.ipAddress": ip,
-          "viewDetails.viewedAt": { $gt: oneHourAgo },
-        });
+        const oneHourAgo = new Date(now - 3600000);
+        const existingView = await blogsCollection.findOne(
+          {
+            _id: blogId,
+            "viewDetails.ipAddress": ip,
+            "viewDetails.viewedAt": { $gt: oneHourAgo },
+          },
+          { projection: { views: 1 } }
+        );
 
         if (existingView) {
           return res.json({
@@ -1479,30 +1800,28 @@ async function run() {
             $inc: { views: 1 },
             $push: {
               viewDetails: {
-                viewedAt: new Date(),
+                viewedAt: now,
                 userAgent,
                 ipAddress: ip,
                 referrer,
                 sessionId: req.sessionID || null,
+                // Additional useful fields:
+                isMobile: /mobile/i.test(userAgent),
+                browser: getBrowser(userAgent), // Implement this helper
+                os: getOS(userAgent), // Implement this helper
               },
             },
           },
           {
             returnDocument: "after",
-            projection: { views: 1, title: 1 },
+            projection: { views: 1 },
           }
         );
-
-        if (!updateResult.value) {
-          return res.status(404).json({
-            success: false,
-            message: "Blog not found",
-          });
-        }
 
         res.json({
           success: true,
           views: updateResult.value.views,
+          isNewView: true,
         });
       } catch (error) {
         console.error("View tracking error:", error);
@@ -1549,7 +1868,6 @@ async function run() {
       }
     });
 
-    // Add comment to blog
     app.post("/api/blogs/:id/comments", async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
@@ -1570,7 +1888,7 @@ async function run() {
 
         // Get author info
         const author = await usersCollection.findOne({
-          _id: new ObjectId(authorId),
+          firebaseUid: authorId,
         });
 
         if (!author) {
@@ -1584,11 +1902,11 @@ async function run() {
           _id: new ObjectId(),
           content,
           author: {
-            id: new ObjectId(authorId),
+            authorId, // Store Firebase UID as string
             name: author.name,
             avatar: author.avatar,
           },
-          likes: [],
+          likes: [], // This will store Firebase UIDs as strings
           createdAt: new Date(),
         };
 
@@ -1620,18 +1938,22 @@ async function run() {
     // Like/unlike comment
     app.patch("/api/comments/:id/like", async (req, res) => {
       try {
-        if (
-          !ObjectId.isValid(req.params.id) ||
-          !ObjectId.isValid(req.body.userId)
-        ) {
+        if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid ID format",
+            message: "Invalid comment ID format",
+          });
+        }
+
+        const { authorId } = req.body; // This is Firebase UID (string)
+        if (!authorId) {
+          return res.status(400).json({
+            success: false,
+            message: "Author ID is required",
           });
         }
 
         const commentId = new ObjectId(req.params.id);
-        const userId = new ObjectId(req.body.userId);
 
         // Find the blog containing the comment
         const blog = await blogsCollection.findOne({
@@ -1645,20 +1967,20 @@ async function run() {
           });
         }
 
-        // Find the comment and update likes
+        // Find the comment
         const comment = blog.comments.find((c) => c._id.equals(commentId));
-        const likeIndex = comment.likes.findIndex((id) => id.equals(userId));
+        const likeIndex = comment.likes.indexOf(authorId); // Compare strings
 
         let update;
         let isLiked;
 
         if (likeIndex === -1) {
           // Add like
-          update = { $push: { "comments.$[elem].likes": userId } };
+          update = { $push: { "comments.$[elem].likes": authorId } };
           isLiked = true;
         } else {
           // Remove like
-          update = { $pull: { "comments.$[elem].likes": userId } };
+          update = { $pull: { "comments.$[elem].likes": authorId } };
           isLiked = false;
         }
 
@@ -1675,7 +1997,7 @@ async function run() {
           });
         }
 
-        // Get updated likes count
+        // Get updated comment
         const updatedBlog = await blogsCollection.findOne({ _id: blog._id });
         const updatedComment = updatedBlog.comments.find((c) =>
           c._id.equals(commentId)
@@ -1708,7 +2030,7 @@ app.get("/", (req, res) => {
 });
 
 // ====== Start Server ======
-app.listen(port, () => {
-  console.log(`🚀 Server listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`🚀 Server listening on port ${port}`);
+// });
 module.exports = app;
