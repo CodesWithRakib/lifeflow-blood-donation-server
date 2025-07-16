@@ -1209,40 +1209,104 @@ async function run() {
       }
     });
 
-    app.patch("api/donations/donate/:id", async (req, res) => {
+    app.patch("/api/donations/:id/donate", async (req, res) => {
       try {
         const { id } = req.params;
-        const { status, donorName, donorEmail } = req.body;
+        const { status, donor } = req.body;
 
+        // Validate ObjectId
         if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Invalid ID format" });
+          return res.status(400).json({
+            success: false,
+            error: "Invalid ID format",
+          });
         }
+
+        // Validate required fields
+        if (status !== "inprogress") {
+          return res.status(400).json({
+            success: false,
+            error: "Status must be 'inprogress' for donation",
+          });
+        }
+
+        if (!donor || !donor.email || !donor.name) {
+          return res.status(400).json({
+            success: false,
+            error: "Donor information is required",
+          });
+        }
+
+        // Additional validation to prevent self-donation
+        const existingRequest = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!existingRequest) {
+          return res.status(404).json({
+            success: false,
+            error: "Request not found",
+          });
+        }
+
+        if (existingRequest.requesterEmail === donor.email) {
+          return res.status(400).json({
+            success: false,
+            error: "Cannot donate to your own request",
+          });
+        }
+
+        if (existingRequest.status !== "pending") {
+          return res.status(400).json({
+            success: false,
+            error: "Request is no longer available for donation",
+          });
+        }
+
+        // Prepare update with additional metadata
+        const updateDoc = {
+          $set: {
+            status,
+            donor: {
+              ...donor,
+              donatedAt: new Date(),
+            },
+            updatedAt: new Date(),
+          },
+        };
 
         const result = await donationRequestCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status, updatedAt: new Date(), donorName, donorEmail } }
+          updateDoc
         );
 
         if (result.matchedCount === 0) {
-          return res
-            .status(404)
-            .json({ success: false, error: "Request not found" });
+          return res.status(404).json({
+            success: false,
+            error: "Request not found",
+          });
         }
 
         res.json({
           success: result.modifiedCount === 1,
           message:
             result.modifiedCount === 1
-              ? "Status updated successfully"
+              ? "Donation confirmed successfully"
               : "No changes made",
+          data: {
+            donationId: id,
+            donor: donor.email,
+            status,
+          },
         });
       } catch (error) {
         console.error("Error updating donation status:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          details:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
@@ -1289,17 +1353,12 @@ async function run() {
       }
     });
 
-    app.delete(
-      "/api/donations/:id",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const result = await donationRequestCollection.deleteOne({
-          _id: new ObjectId(req.params.id),
-        });
-        res.json({ success: result.deletedCount === 1 });
-      }
-    );
+    app.delete("/api/donations/:id", verifyJWT, async (req, res) => {
+      const result = await donationRequestCollection.deleteOne({
+        _id: new ObjectId(req.params.id),
+      });
+      res.json({ success: result.deletedCount === 1 });
+    });
 
     // Get all blogs with filtering and pagination
     app.get("/api/blogs", async (req, res) => {
