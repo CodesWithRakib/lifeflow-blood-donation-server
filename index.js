@@ -535,12 +535,11 @@ async function run() {
     // ==============================
     // GET all users (Admin only)
     // ==============================
-    app.get("/api/users", verifyJWT, async (req, res) => {
+    app.get("/api/users", verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const email = req.decoded?.email;
-        const { status, page = 1, limit = 10 } = req.query;
+        const { status, role, search, page = 1, limit = 10 } = req.query;
 
-        // Validate inputs
         const pageNum = parseInt(page);
         const limitNum = parseInt(limit);
         if (isNaN(pageNum) || isNaN(limitNum)) {
@@ -549,7 +548,6 @@ async function run() {
             .json({ message: "Invalid pagination parameters" });
         }
 
-        // Check admin privileges
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${email}$`, "i") },
         });
@@ -558,21 +556,25 @@ async function run() {
           return res.status(403).json({ message: "Forbidden: Admins only." });
         }
 
-        // Build query filter
         const filter = {};
-        if (status) {
-          filter.status = status;
+        if (status) filter.status = status;
+        if (role) filter.role = role;
+        if (search) {
+          filter.$or = [
+            { name: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+            { district: { $regex: search, $options: "i" } },
+            { upazila: { $regex: search, $options: "i" } },
+          ];
         }
 
-        // Get paginated users
         const users = await usersCollection
           .find(filter)
-          .sort({ createdAt: -1 }) // or any other field you want to sort by
+          .sort({ createdAt: -1 })
           .skip((pageNum - 1) * limitNum)
           .limit(limitNum)
           .toArray();
 
-        // Get total count for pagination info
         const totalCount = await usersCollection.countDocuments(filter);
 
         res.status(200).json({
@@ -1230,7 +1232,7 @@ async function run() {
     app.patch("/api/donations/:id/donate", async (req, res) => {
       try {
         const { id } = req.params;
-        const { status, donor ,donationId} = req.body;
+        const { status, donor, donationId } = req.body;
 
         // Validate ObjectId
         if (!ObjectId.isValid(id)) {
