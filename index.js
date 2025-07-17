@@ -512,11 +512,11 @@ async function run() {
         await transporter.sendMail({
           from: process.env.EMAIL_USER,
           to: email,
-          subject: "Thank you for contacting Donorly",
+          subject: "Thank you for contacting LifeFlow",
           html: `<h2>Hi ${name},</h2>
                  <p>We received your message:</p>
                  <blockquote>${message}</blockquote>
-                 <p>We'll respond within 24h.</p><p>— Donorly Team</p>`,
+                 <p>We'll respond within 24h.</p><p>— LifeFlow Team</p>`,
         });
         // notify admin
         await transporter.sendMail({
@@ -998,6 +998,24 @@ async function run() {
           .json({ success: false, error: "Internal server error" });
       }
     });
+
+    app.get("/api/donations/my-donations", verifyJWT, async (req, res) => {
+      try {
+        const email = req.userEmail;
+        console.log(email);
+        const requests = await donationRequestCollection
+          .find({ "donor.email": email })
+          .toArray();
+
+        res.json({ success: true, data: requests });
+      } catch (error) {
+        console.error("Error fetching donation requests:", error);
+        res
+          .status(500)
+          .json({ success: false, error: "Internal server error" });
+      }
+    });
+
     // get all donation requests by email
     app.get("/api/donations/:email/my-requests", async (req, res) => {
       try {
