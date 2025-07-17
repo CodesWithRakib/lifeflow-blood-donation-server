@@ -1230,7 +1230,7 @@ async function run() {
     app.patch("/api/donations/:id/donate", async (req, res) => {
       try {
         const { id } = req.params;
-        const { status, donor } = req.body;
+        const { status, donor ,donationId} = req.body;
 
         // Validate ObjectId
         if (!ObjectId.isValid(id)) {
@@ -1285,6 +1285,7 @@ async function run() {
         const updateDoc = {
           $set: {
             status,
+            donationId,
             donor: {
               ...donor,
               donatedAt: new Date(),
