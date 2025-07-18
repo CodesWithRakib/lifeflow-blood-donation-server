@@ -146,7 +146,7 @@ async function run() {
     });
 
     // ====== FUNDING ROUTES ======
-    app.get("/api/funds", async (req, res) => {
+    app.get("/api/funds", verifyJWT, async (req, res) => {
       // Validate and parse pagination parameters
       const page = Math.max(1, parseInt(req.query.page)) || 1;
       const limit = Math.min(100, Math.max(1, parseInt(req.query.limit))) || 10;
@@ -218,7 +218,7 @@ async function run() {
       }
     });
 
-    app.get("/api/funds/stats", async (req, res) => {
+    app.get("/api/funds/stats", verifyJWT, async (req, res) => {
       try {
         const now = new Date();
         const oneWeekAgo = new Date(now);
@@ -400,7 +400,7 @@ async function run() {
     });
 
     // Add this endpoint to your existing routes
-    app.get("/api/funds/report", async (req, res) => {
+    app.get("/api/funds/report", verifyJWT, async (req, res) => {
       try {
         // Fetch data
         const [stats, recentDonations] = await Promise.all([
@@ -642,7 +642,7 @@ async function run() {
     });
 
     // Record donation endpoint
-    app.post("/api/funds", async (req, res) => {
+    app.post("/api/funds", verifyJWT, async (req, res) => {
       const {
         userEmail,
         userName,
@@ -1095,7 +1095,7 @@ async function run() {
     // ==============================
     // PATCH update user by email
     // ==============================
-    app.patch("/api/user/:email", async (req, res) => {
+    app.patch("/api/user/:email", verifyJWT, async (req, res) => {
       const { email } = req.params;
       const updates = req.body;
 
@@ -1182,38 +1182,43 @@ async function run() {
     // ==============================
     // PATCH update user role
     // ==============================
-    app.patch("/api/user/:id/role", async (req, res) => {
-      const { role } = req.body;
-      const { id } = req.params;
+    app.patch(
+      "/api/user/:id/role",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        const { role } = req.body;
+        const { id } = req.params;
 
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).json({ message: "Invalid user ID" });
-      }
-
-      if (!role || !allowedRoles.includes(role)) {
-        return res.status(400).json({ message: "Invalid or missing role" });
-      }
-
-      try {
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { role } }
-        );
-
-        if (result.modifiedCount === 0) {
-          return res
-            .status(404)
-            .json({ message: "User not found or role unchanged" });
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid user ID" });
         }
 
-        res.status(200).json({ message: "Role updated", success: true });
-      } catch (error) {
-        res.status(500).json({ message: "Role update failed", error });
+        if (!role || !allowedRoles.includes(role)) {
+          return res.status(400).json({ message: "Invalid or missing role" });
+        }
+
+        try {
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { role } }
+          );
+
+          if (result.modifiedCount === 0) {
+            return res
+              .status(404)
+              .json({ message: "User not found or role unchanged" });
+          }
+
+          res.status(200).json({ message: "Role updated", success: true });
+        } catch (error) {
+          res.status(500).json({ message: "Role update failed", error });
+        }
       }
-    });
+    );
 
     // GET all donation requests with filters + pagination
-    app.get("/api/donations", async (req, res) => {
+    app.get("/api/donations", verifyJWT, async (req, res) => {
       try {
         const {
           page = 1,
@@ -1306,47 +1311,51 @@ async function run() {
     });
 
     // get all donation requests by email
-    app.get("/api/donations/:email/my-requests", async (req, res) => {
-      try {
-        const email = req.params.email;
-        const { status, page = 1, limit = 10 } = req.query;
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        const filter = { requesterEmail: email };
-        if (status && status !== "all") filter.status = status;
+    app.get(
+      "/api/donations/:email/my-requests",
+      verifyJWT,
+      async (req, res) => {
+        try {
+          const email = req.params.email;
+          const { status, page = 1, limit = 10 } = req.query;
+          const skip = (parseInt(page) - 1) * parseInt(limit);
+          const filter = { requesterEmail: email };
+          if (status && status !== "all") filter.status = status;
 
-        const [requests, totalCount] = await Promise.all([
-          donationRequestCollection
-            .find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(parseInt(limit))
-            .toArray(),
-          donationRequestCollection.countDocuments(filter),
-        ]);
+          const [requests, totalCount] = await Promise.all([
+            donationRequestCollection
+              .find(filter)
+              .sort({ createdAt: -1 })
+              .skip(skip)
+              .limit(parseInt(limit))
+              .toArray(),
+            donationRequestCollection.countDocuments(filter),
+          ]);
 
-        const totalPages = Math.ceil(totalCount / parseInt(limit));
+          const totalPages = Math.ceil(totalCount / parseInt(limit));
 
-        res.json({
-          success: true,
-          data: requests,
-          pagination: {
-            totalItems: totalCount,
-            totalPages,
-            currentPage: parseInt(page),
-            itemsPerPage: parseInt(limit),
-            hasNext: parseInt(page) < totalPages,
-            hasPrevious: parseInt(page) > 1,
-          },
-        });
-      } catch (error) {
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+          res.json({
+            success: true,
+            data: requests,
+            pagination: {
+              totalItems: totalCount,
+              totalPages,
+              currentPage: parseInt(page),
+              itemsPerPage: parseInt(limit),
+              hasNext: parseInt(page) < totalPages,
+              hasPrevious: parseInt(page) > 1,
+            },
+          });
+        } catch (error) {
+          res
+            .status(500)
+            .json({ success: false, error: "Internal server error" });
+        }
       }
-    });
+    );
 
     // GET recent 3 donation requests (sorted by date descending)
-    app.get("/api/donations/recent/:email", async (req, res) => {
+    app.get("/api/donations/recent/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
         const requests = await donationRequestCollection
@@ -1364,7 +1373,7 @@ async function run() {
     });
 
     // GET single donation request by ID
-    app.get("/api/donations/:id", async (req, res) => {
+    app.get("/api/donations/:id", verifyJWT, async (req, res) => {
       try {
         const id = req.params.id;
 
@@ -1453,7 +1462,7 @@ async function run() {
       }
     });
 
-    app.patch("/api/donations/:id", async (req, res) => {
+    app.patch("/api/donations/:id", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
         const {
@@ -1516,7 +1525,7 @@ async function run() {
       }
     });
 
-    app.patch("/api/donations/:id/donate", async (req, res) => {
+    app.patch("/api/donations/:id/donate", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
         const { status, donor, donationId } = req.body;
@@ -1767,7 +1776,7 @@ async function run() {
       }
     });
 
-    app.get("/api/blogs/:id", async (req, res) => {
+    app.get("/api/blogs/:id", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -1800,7 +1809,7 @@ async function run() {
     });
 
     // Create new blog
-    app.post("/api/blogs", async (req, res) => {
+    app.post("/api/blogs", verifyJWT, async (req, res) => {
       try {
         const { title, content, thumbnail, authorId, authorImage, slug } =
           req.body;
@@ -1872,7 +1881,7 @@ async function run() {
     });
 
     // Update blog
-    app.put("/api/blogs/:id", async (req, res) => {
+    app.put("/api/blogs/:id", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -1927,7 +1936,7 @@ async function run() {
     });
 
     // Like/unlike a blog
-    app.patch("/api/blogs/:id/like", async (req, res) => {
+    app.patch("/api/blogs/:id/like", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -1995,7 +2004,7 @@ async function run() {
     });
 
     // Bookmark/unbookmark a blog
-    app.patch("/api/blogs/:id/bookmark", async (req, res) => {
+    app.patch("/api/blogs/:id/bookmark", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -2062,7 +2071,7 @@ async function run() {
     });
 
     // Update blog status
-    app.patch("/api/blogs/:id/status", async (req, res) => {
+    app.patch("/api/blogs/:id/status", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -2111,7 +2120,7 @@ async function run() {
     });
 
     // Track blog view
-    app.patch("/api/blogs/:id/views", async (req, res) => {
+    app.patch("/api/blogs/:id/views", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -2202,7 +2211,7 @@ async function run() {
     });
 
     // Delete blog
-    app.delete("/api/blogs/:id", async (req, res) => {
+    app.delete("/api/blogs/:id", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -2235,7 +2244,7 @@ async function run() {
       }
     });
 
-    app.post("/api/blogs/:id/comments", async (req, res) => {
+    app.post("/api/blogs/:id/comments", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
@@ -2303,7 +2312,7 @@ async function run() {
     });
 
     // Like/unlike comment
-    app.patch("/api/comments/:id/like", async (req, res) => {
+    app.patch("/api/comments/:id/like", verifyJWT, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.params.id)) {
           return res.status(400).json({
