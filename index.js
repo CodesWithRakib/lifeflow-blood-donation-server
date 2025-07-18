@@ -6,6 +6,9 @@ const nodemailer = require("nodemailer");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const PDFDocument = require("pdfkit");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 // const port = process.env.PORT || 5000;
@@ -218,11 +221,24 @@ async function run() {
 
     app.get("/api/funds/stats", async (req, res) => {
       try {
-        const oneWeekAgo = new Date();
-        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+        const now = new Date();
+        const oneWeekAgo = new Date(now);
+        oneWeekAgo.setDate(now.getDate() - 7);
 
-        // Fetch overall stats, recent donation, and weekly day-wise trend
-        const [totalStats, recentStats, weeklyStats] = await Promise.all([
+        const oneMonthAgo = new Date(now);
+        oneMonthAgo.setMonth(now.getMonth() - 1);
+
+        const oneYearAgo = new Date(now);
+        oneYearAgo.setFullYear(now.getFullYear() - 1);
+
+        // Fetch all stats in parallel
+        const [
+          totalStats,
+          recentStats,
+          weeklyStats,
+          monthlyStats,
+          yearlyStats,
+        ] = await Promise.all([
           fundingCollection
             .aggregate([
               {
@@ -236,6 +252,7 @@ async function run() {
               },
             ])
             .toArray(),
+
           fundingCollection.findOne(
             {},
             {
@@ -248,6 +265,8 @@ async function run() {
               },
             }
           ),
+
+          // Weekly stats (last 7 days)
           fundingCollection
             .aggregate([
               {
@@ -261,6 +280,52 @@ async function run() {
                     $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
                   },
                   total: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                  donors: { $addToSet: "$userEmail" },
+                },
+              },
+              { $sort: { _id: 1 } },
+            ])
+            .toArray(),
+
+          // Monthly stats (last 30 days)
+          fundingCollection
+            .aggregate([
+              {
+                $match: {
+                  createdAt: { $gte: oneMonthAgo },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+                  },
+                  total: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                  donors: { $addToSet: "$userEmail" },
+                },
+              },
+              { $sort: { _id: 1 } },
+            ])
+            .toArray(),
+
+          // Yearly stats (last 12 months)
+          fundingCollection
+            .aggregate([
+              {
+                $match: {
+                  createdAt: { $gte: oneYearAgo },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: { format: "%Y-%m", date: "$createdAt" },
+                  },
+                  total: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                  donors: { $addToSet: "$userEmail" },
                 },
               },
               { $sort: { _id: 1 } },
@@ -287,17 +352,39 @@ async function run() {
               date: recentStats?.createdAt || null,
             },
 
-            // Weekly totals
-            weeklyTotal: weeklyStats.reduce((sum, item) => sum + item.total, 0),
-            weeklyDonors:
-              new Set(weeklyStats.flatMap((item) => item.userEmail)).size || 0,
-            weeklyDonations: weeklyStats.length,
+            // Time period stats
+            weekly: {
+              total: weeklyStats.reduce((sum, item) => sum + item.total, 0),
+              donors: new Set(weeklyStats.flatMap((item) => item.donors)).size,
+              donations: weeklyStats.reduce((sum, item) => sum + item.count, 0),
+              trends: weeklyStats.map((entry) => ({
+                date: entry._id,
+                total: entry.total,
+              })),
+            },
 
-            // Trend chart data
-            weeklyTrends: weeklyStats.map((entry) => ({
-              date: entry._id, // e.g., "2025-07-08"
-              total: entry.total, // Total amount donated that day
-            })),
+            monthly: {
+              total: monthlyStats.reduce((sum, item) => sum + item.total, 0),
+              donors: new Set(monthlyStats.flatMap((item) => item.donors)).size,
+              donations: monthlyStats.reduce(
+                (sum, item) => sum + item.count,
+                0
+              ),
+              trends: monthlyStats.map((entry) => ({
+                date: entry._id,
+                total: entry.total,
+              })),
+            },
+
+            yearly: {
+              total: yearlyStats.reduce((sum, item) => sum + item.total, 0),
+              donors: new Set(yearlyStats.flatMap((item) => item.donors)).size,
+              donations: yearlyStats.reduce((sum, item) => sum + item.count, 0),
+              trends: yearlyStats.map((entry) => ({
+                date: entry._id,
+                total: entry.total,
+              })),
+            },
 
             primaryCurrency: "usd",
           },
@@ -307,6 +394,194 @@ async function run() {
         res.status(500).json({
           success: false,
           message: "Failed to fetch funding statistics",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
+
+    // Add this endpoint to your existing routes
+    app.get("/api/funds/report", async (req, res) => {
+      try {
+        // Fetch data
+        const [stats, recentDonations] = await Promise.all([
+          fundingCollection
+            .aggregate([
+              /* your aggregation */
+            ])
+            .toArray(),
+          fundingCollection.find().sort({ createdAt: -1 }).limit(10).toArray(),
+        ]);
+
+        const reportStats = stats[0] || {};
+        const now = new Date();
+
+        // PDF Setup
+        const doc = new PDFDocument({
+          margin: 50,
+          size: "A4",
+          info: {
+            Title: "LifeFlow Donation Report",
+            Author: "LifeFlow System",
+            CreationDate: now,
+          },
+        });
+
+        // Response headers
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename=donation-report-${
+            now.toISOString().split("T")[0]
+          }.pdf`
+        );
+
+        doc.pipe(res);
+
+        // Styles
+        const primaryColor = "#e74c3c"; // Blood red
+        const secondaryColor = "#34495e"; // Dark blue-gray
+        const lightGray = "#f5f5f5";
+
+        // Header
+        doc
+          .fillColor(primaryColor)
+          .fontSize(24)
+          .font("Helvetica-Bold")
+          .text("LIFEFLOW DONATION REPORT", {
+            align: "center",
+            underline: true,
+            underlineColor: primaryColor,
+          })
+          .moveDown(0.5);
+
+        doc
+          .fillColor(secondaryColor)
+          .fontSize(10)
+          .text(`Generated on: ${now.toLocaleString()}`, { align: "center" })
+          .moveDown(2);
+
+        // Summary Section with better styling
+        doc
+          .fillColor(secondaryColor)
+          .fontSize(16)
+          .font("Helvetica-Bold")
+          .text("SUMMARY STATISTICS", { underline: true })
+          .moveDown(1);
+
+        // Summary table
+        const summaryY = doc.y;
+        const summaryCol1 = 50;
+        const summaryCol2 = 350;
+
+        // Table header
+        doc
+          .fillColor("#ffffff")
+          .rect(summaryCol1 - 10, summaryY - 10, 400, 25)
+          .fill(secondaryColor)
+          .fillColor("#ffffff")
+          .font("Helvetica-Bold")
+          .text("Metric", summaryCol1, summaryY)
+          .text("Value", summaryCol2, summaryY, { align: "right" })
+          .moveDown(1);
+
+        // Table rows with alternating background
+        const summaryData = [
+          {
+            label: "Total Funds Raised",
+            value: `$${(reportStats.totalFunds || 0).toLocaleString()}`,
+          },
+          {
+            label: "Total Donations",
+            value: (reportStats.count || 0).toLocaleString(),
+          },
+          {
+            label: "Unique Donors",
+            value: (reportStats.uniqueDonors?.length || 0).toLocaleString(),
+          },
+          {
+            label: "Average Donation",
+            value: `$${(reportStats.avgAmount || 0).toFixed(2)}`,
+          },
+        ];
+
+        summaryData.forEach((row, i) => {
+          const y = doc.y;
+          doc
+            .fillColor(i % 2 === 0 ? lightGray : "#ffffff")
+            .rect(summaryCol1 - 10, y - 5, 400, 25)
+            .fill()
+            .fillColor(secondaryColor)
+            .font("Helvetica")
+            .text(row.label, summaryCol1, y)
+            .text(row.value, summaryCol2, y, { align: "right" })
+            .moveDown(1);
+        });
+
+        doc.moveDown(2);
+
+        // Recent Donations Section
+        doc
+          .fillColor(secondaryColor)
+          .fontSize(16)
+          .font("Helvetica-Bold")
+          .text("RECENT DONATIONS", { underline: true })
+          .moveDown(1);
+
+        // Donations table
+        const tableTop = doc.y;
+        const col1 = 50; // Date
+        const col2 = 150; // Donor
+        const col3 = 350; // Amount (right-aligned)
+        const colWidth = 100;
+        const rowHeight = 25;
+
+        // Table header
+        doc
+          .fillColor("#ffffff")
+          .rect(col1 - 10, tableTop - 10, 400, rowHeight)
+          .fill(secondaryColor)
+          .fillColor("#ffffff")
+          .font("Helvetica-Bold")
+          .text("Date", col1, tableTop)
+          .text("Donor", col2, tableTop)
+          .text("Amount", col3, tableTop, { width: colWidth, align: "right" })
+          .moveDown(1);
+
+        // Table rows
+        recentDonations.forEach((donation, i) => {
+          const y = tableTop + (i + 1) * rowHeight;
+
+          doc
+            .fillColor(i % 2 === 0 ? lightGray : "#ffffff")
+            .rect(col1 - 10, y - 5, 400, rowHeight)
+            .fill()
+            .fillColor(secondaryColor)
+            .font("Helvetica")
+            .text(new Date(donation.createdAt).toLocaleDateString(), col1, y)
+            .text(donation.userName || "Anonymous", col2, y)
+            .text(`$${(donation.amount || 0).toLocaleString()}`, col3, y, {
+              width: colWidth,
+              align: "right",
+            });
+        });
+
+        // Footer
+        doc
+          .fillColor(secondaryColor)
+          .fontSize(10)
+          .text("© LifeFlow Blood Donation System | Confidential", {
+            align: "center",
+            lineGap: 5,
+          })
+          .text(`Page ${doc.bufferedPageRange().count}`, { align: "center" });
+
+        doc.end();
+      } catch (error) {
+        console.error("[GET /funds/report] Error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to generate report",
           error:
             process.env.NODE_ENV === "development" ? error.message : undefined,
         });
@@ -838,7 +1113,7 @@ async function run() {
     // ==============================
     // DELETE user by MongoDB ID
     // ==============================
-    app.delete("/api/user/:id", async (req, res) => {
+    app.delete("/api/user/:id", verifyJWT, async (req, res) => {
       const { id } = req.params;
 
       if (!ObjectId.isValid(id)) {
@@ -863,35 +1138,40 @@ async function run() {
     // ==============================
     // PATCH update user status
     // ==============================
-    app.patch("/api/user/:id/status", async (req, res) => {
-      const { status } = req.body;
-      const { id } = req.params;
+    app.patch(
+      "/api/user/:id/status",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        const { status } = req.body;
+        const { id } = req.params;
 
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).json({ message: "Invalid user ID" });
-      }
-
-      if (!status || !allowedStatuses.includes(status)) {
-        return res.status(400).json({ message: "Invalid or missing status" });
-      }
-
-      try {
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { status } }
-        );
-
-        if (result.modifiedCount === 0) {
-          return res
-            .status(404)
-            .json({ message: "User not found or status unchanged" });
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid user ID" });
         }
 
-        res.status(200).json({ message: "Status updated", success: true });
-      } catch (error) {
-        res.status(500).json({ message: "Status update failed", error });
+        if (!status || !allowedStatuses.includes(status)) {
+          return res.status(400).json({ message: "Invalid or missing status" });
+        }
+
+        try {
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status } }
+          );
+
+          if (result.modifiedCount === 0) {
+            return res
+              .status(404)
+              .json({ message: "User not found or status unchanged" });
+          }
+
+          res.status(200).json({ message: "Status updated", success: true });
+        } catch (error) {
+          res.status(500).json({ message: "Status update failed", error });
+        }
       }
-    });
+    );
     // ==============================
     // PATCH update user role
     // ==============================
