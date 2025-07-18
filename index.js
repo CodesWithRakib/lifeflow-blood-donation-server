@@ -407,7 +407,15 @@ async function run() {
         const [stats, recentDonations] = await Promise.all([
           fundingCollection
             .aggregate([
-              /* your aggregation */
+              {
+                $group: {
+                  _id: null,
+                  totalFunds: { $sum: "$amount" },
+                  uniqueDonors: { $addToSet: "$userEmail" },
+                  count: { $sum: 1 },
+                  avgAmount: { $avg: "$amount" },
+                },
+              },
             ])
             .toArray(),
           fundingCollection.find().sort({ createdAt: -1 }).limit(10).toArray(),
