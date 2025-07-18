@@ -11,7 +11,6 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-// const port = process.env.PORT || 5000;
 
 // ====== Middleware Setup ======
 const corsOptions = {
@@ -2397,8 +2396,4 @@ app.get("/", (req, res) => {
   res.send("🩸 Blood Donation App Server is Running");
 });
 
-// ====== Start Server ======
-// app.listen(port, () => {
-//   console.log(`🚀 Server listening on port ${port}`);
-// });
 module.exports = app;
