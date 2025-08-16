@@ -82,6 +82,7 @@ const client = new MongoClient(process.env.DB_URI, {
 
 let usersCollection,
   donationRequestCollection,
+  emergencyRequestCollection,
   blogsCollection,
   fundingCollection;
 
@@ -113,6 +114,7 @@ async function run() {
     const db = client.db("bloodDonationApp");
     usersCollection = db.collection("users");
     donationRequestCollection = db.collection("donationRequest");
+    emergencyRequestCollection = db.collection("emergencyRequests");
     fundingCollection = db.collection("funds");
     blogsCollection = db.collection("blogs");
 
@@ -1021,19 +1023,31 @@ async function run() {
         bloodGroup,
         district,
         upazila,
+        phone,
         role = "donor",
         status = "active",
+        notifications = true,
+        showDonorStatus = true,
+        showBloodType = true,
+        language = "en",
       } = req.body;
 
-      if (!email || !name) {
+      // Input validation
+      if (!email || !name || !firebaseUid) {
         return res.status(400).json({
           success: false,
-          message: "Name and email are required",
-          field: !email ? "email" : "name",
+          message: "Firebase UID, name and email are required",
+          missingFields: [
+            ...(!firebaseUid ? ["firebaseUid"] : []),
+            ...(!email ? ["email"] : []),
+            ...(!name ? ["name"] : []),
+          ],
         });
       }
 
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
         return res.status(400).json({
           success: false,
           message: "Invalid email format",
@@ -1041,9 +1055,45 @@ async function run() {
         });
       }
 
+      // Validate blood group if provided
+      const validBloodGroups = [
+        "A+",
+        "A-",
+        "B+",
+        "B-",
+        "AB+",
+        "AB-",
+        "O+",
+        "O-",
+        null,
+      ];
+      if (bloodGroup && !validBloodGroups.includes(bloodGroup)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid blood group",
+          field: "bloodGroup",
+          validOptions: validBloodGroups.filter((bg) => bg !== null),
+        });
+      }
+
+      // Validate role
+      const validRoles = ["donor", "recipient", "admin"];
+      if (!validRoles.includes(role)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid user role",
+          field: "role",
+          validOptions: validRoles,
+        });
+      }
+
       try {
+        // Check for existing user by email or firebaseUid
         const existingUser = await usersCollection.findOne({
-          email: { $regex: new RegExp(`^${email}$`, "i") },
+          $or: [
+            { email: { $regex: new RegExp(`^${email}$`, "i") } },
+            { firebaseUid },
+          ],
         });
 
         if (existingUser) {
@@ -1051,12 +1101,15 @@ async function run() {
             success: true,
             message: "User already exists",
             data: {
-              authorId: existingUser._id,
+              userId: existingUser._id,
               email: existingUser.email,
+              name: existingUser.name,
+              role: existingUser.role,
             },
           });
         }
 
+        // Prepare new user document
         const newUser = {
           firebaseUid,
           name: name.trim(),
@@ -1065,29 +1118,53 @@ async function run() {
           bloodGroup: bloodGroup || null,
           district: district || null,
           upazila: upazila || null,
+          phone: phone || null,
           role,
           status,
+          notifications,
+          showDonorStatus,
+          showBloodType,
+          language,
           createdAt: new Date(),
           updatedAt: new Date(),
+          lastLogin: new Date(),
+          donationHistory: [],
+          totalDonations: 0,
         };
 
+        // Insert new user
         const result = await usersCollection.insertOne(newUser);
+
+        // Create a clean response without sensitive data
+        const userResponse = {
+          userId: result.insertedId,
+          email: newUser.email,
+          name: newUser.name,
+          role: newUser.role,
+          status: newUser.status,
+          createdAt: newUser.createdAt,
+        };
 
         res.status(201).json({
           success: true,
           message: "User created successfully",
-          data: {
-            userId: result.insertedId,
-            email: newUser.email,
-            name: newUser.name,
-          },
+          data: userResponse,
         });
+
+        // Optional: Send welcome email or other post-registration actions
+        // await sendWelcomeEmail(newUser.email, newUser.name);
       } catch (error) {
+        console.error("User creation error:", error);
         res.status(500).json({
           success: false,
           message: "User creation failed",
           error:
-            process.env.NODE_ENV === "development" ? error.message : undefined,
+            process.env.NODE_ENV === "development"
+              ? {
+                  message: error.message,
+                  stack: error.stack,
+                }
+              : undefined,
         });
       }
     });
@@ -1098,22 +1175,73 @@ async function run() {
     app.patch("/api/user/:email", verifyJWT, async (req, res) => {
       const { email } = req.params;
       const updates = req.body;
+      const requestingUserEmail = req.userEmail;
+
+      // Validate that the requesting user can only update their own profile
+      if (requestingUserEmail !== email) {
+        return res.status(403).json({
+          message: "Unauthorized - You can only update your own profile",
+          success: false,
+        });
+      }
+
+      // Define allowed fields that can be updated
+      const allowedUpdates = [
+        "name",
+        "avatar",
+        "district",
+        "upazila",
+        "bloodGroup",
+        "phone",
+        "notifications",
+        "language",
+        "showDonorStatus",
+        "showBloodType",
+      ];
+
+      // Filter updates to only include allowed fields
+      const filteredUpdates = Object.keys(updates)
+        .filter((key) => allowedUpdates.includes(key))
+        .reduce((obj, key) => {
+          obj[key] = updates[key];
+          return obj;
+        }, {});
+
+      // Check if there are valid updates after filtering
+      if (Object.keys(filteredUpdates).length === 0) {
+        return res.status(400).json({
+          message: "No valid fields to update",
+          success: false,
+          allowedFields: allowedUpdates,
+        });
+      }
 
       try {
         const result = await usersCollection.updateOne(
           { email },
-          { $set: updates }
+          { $set: filteredUpdates }
         );
 
         if (result.modifiedCount === 0) {
-          return res
-            .status(404)
-            .json({ message: "User not found or no changes made" });
+          return res.status(404).json({
+            message: "User not found or no changes made",
+            success: false,
+          });
         }
 
-        res.status(200).json({ message: "User updated", success: true });
+        res.status(200).json({
+          message: "User updated successfully",
+          success: true,
+          updatedFields: Object.keys(filteredUpdates),
+        });
       } catch (error) {
-        res.status(500).json({ message: "Update failed", error });
+        console.error("Update error:", error);
+        res.status(500).json({
+          message: "Update failed",
+          success: false,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
@@ -1218,7 +1346,7 @@ async function run() {
     );
 
     // GET all donation requests with filters + pagination
-    app.get("/api/donations", verifyJWT, async (req, res) => {
+    app.get("/api/donations", async (req, res) => {
       try {
         const {
           page = 1,
@@ -1232,35 +1360,139 @@ async function run() {
           search,
           startDate,
           endDate,
+          urgencyLevel,
+          contactPerson,
         } = req.query;
-
         const pageNumber = parseInt(page);
         const limitNumber = parseInt(limit);
         const skip = (pageNumber - 1) * limitNumber;
-        const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
 
-        const filter = {};
-
-        if (status) filter.status = status;
-        if (bloodGroup) filter.bloodGroup = bloodGroup;
-        if (district) filter.district = district;
-        if (upazila) filter.upazila = upazila;
-
-        if (startDate || endDate) {
-          filter.createdAt = {};
-          if (startDate) filter.createdAt.$gte = new Date(startDate);
-          if (endDate) filter.createdAt.$lte = new Date(endDate);
+        // Validate pagination parameters
+        if (isNaN(pageNumber) || pageNumber < 1) {
+          return res.status(400).json({
+            success: false,
+            error: "Page must be a positive integer",
+          });
+        }
+        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+          return res.status(400).json({
+            success: false,
+            error: "Limit must be between 1 and 100",
+          });
         }
 
+        // Validate sort parameters
+        const validSortFields = [
+          "createdAt",
+          "updatedAt",
+          "date",
+          "time",
+          "recipientName",
+          "bloodGroup",
+          "hospitalName",
+          "status",
+        ];
+        if (!validSortFields.includes(sortBy)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid sort field",
+            validSortFields,
+          });
+        }
+        const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+
+        // Build filter object
+        const filter = {};
+
+        // Status filter
+        if (status) {
+          const validStatuses = ["pending", "inprogress", "done", "canceled"];
+          if (validStatuses.includes(status)) {
+            filter.status = status;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid status value",
+              validStatuses,
+            });
+          }
+        }
+
+        // Blood group filter
+        if (bloodGroup) {
+          const validBloodGroups = [
+            "A+",
+            "A-",
+            "B+",
+            "B-",
+            "AB+",
+            "AB-",
+            "O+",
+            "O-",
+          ];
+          if (validBloodGroups.includes(bloodGroup)) {
+            filter.bloodGroup = bloodGroup;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid blood group",
+              validBloodGroups,
+            });
+          }
+        }
+
+        // Location filters
+        if (district)
+          filter.recipientDistrict = { $regex: district, $options: "i" };
+        if (upazila)
+          filter.recipientUpazila = { $regex: upazila, $options: "i" };
+
+        // Contact person filter
+        if (contactPerson) {
+          filter.contactPerson = { $regex: contactPerson, $options: "i" };
+        }
+
+        // Date range filter
+        if (startDate || endDate) {
+          filter.createdAt = {};
+          if (startDate) {
+            const start = new Date(startDate);
+            if (isNaN(start.getTime())) {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid start date format",
+              });
+            }
+            filter.createdAt.$gte = start;
+          }
+          if (endDate) {
+            const end = new Date(endDate);
+            if (isNaN(end.getTime())) {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid end date format",
+              });
+            }
+            // Set end time to end of day
+            end.setHours(23, 59, 59, 999);
+            filter.createdAt.$lte = end;
+          }
+        }
+
+        // Search filter
         if (search) {
           filter.$or = [
             { recipientName: { $regex: search, $options: "i" } },
-            { hospital: { $regex: search, $options: "i" } },
-            { address: { $regex: search, $options: "i" } },
+            { hospitalName: { $regex: search, $options: "i" } },
+            { hospitalAddress: { $regex: search, $options: "i" } },
+            { reason: { $regex: search, $options: "i" } },
             { message: { $regex: search, $options: "i" } },
+            { contactPerson: { $regex: search, $options: "i" } },
+            { contactEmail: { $regex: search, $options: "i" } },
           ];
         }
 
+        // Execute queries in parallel
         const [requests, totalCount] = await Promise.all([
           donationRequestCollection
             .find(filter)
@@ -1272,7 +1504,6 @@ async function run() {
         ]);
 
         const totalPages = Math.ceil(totalCount / limitNumber);
-
         res.status(200).json({
           success: true,
           data: requests,
@@ -1284,229 +1515,1116 @@ async function run() {
             hasNext: pageNumber < totalPages,
             hasPrevious: pageNumber > 1,
           },
+          filters: {
+            status,
+            bloodGroup,
+            district,
+            upazila,
+            contactPerson,
+            startDate,
+            endDate,
+            search,
+            sortBy,
+            sortOrder,
+          },
         });
       } catch (error) {
         console.error("Error fetching donation requests:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
+    // GET all emergency requests with filters + pagination
+    app.get("/api/emergency-requests", async (req, res) => {
+      try {
+        const {
+          page = 1,
+          limit = 10,
+          status,
+          bloodGroup,
+          district,
+          upazila,
+          sortBy = "createdAt",
+          sortOrder = "desc",
+          search,
+          startDate,
+          endDate,
+          urgencyLevel,
+          contactPerson,
+        } = req.query;
+        const pageNumber = parseInt(page);
+        const limitNumber = parseInt(limit);
+        const skip = (pageNumber - 1) * limitNumber;
+
+        // Validate pagination parameters
+        if (isNaN(pageNumber) || pageNumber < 1) {
+          return res.status(400).json({
+            success: false,
+            error: "Page must be a positive integer",
+          });
+        }
+        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+          return res.status(400).json({
+            success: false,
+            error: "Limit must be between 1 and 100",
+          });
+        }
+
+        // Validate sort parameters
+        const validSortFields = [
+          "createdAt",
+          "updatedAt",
+          "date",
+          "time",
+          "patientName",
+          "bloodGroup",
+          "hospitalName",
+          "urgencyLevel",
+          "status",
+        ];
+        if (!validSortFields.includes(sortBy)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid sort field",
+            validSortFields,
+          });
+        }
+        const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+
+        // Build filter object
+        const filter = {};
+
+        // Status filter
+        if (status) {
+          const validStatuses = ["pending", "inprogress", "done", "canceled"];
+          if (validStatuses.includes(status)) {
+            filter.status = status;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid status value",
+              validStatuses,
+            });
+          }
+        }
+
+        // Blood group filter
+        if (bloodGroup) {
+          const validBloodGroups = [
+            "A+",
+            "A-",
+            "B+",
+            "B-",
+            "AB+",
+            "AB-",
+            "O+",
+            "O-",
+          ];
+          if (validBloodGroups.includes(bloodGroup)) {
+            filter.bloodGroup = bloodGroup;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid blood group",
+              validBloodGroups,
+            });
+          }
+        }
+
+        // Location filters
+        if (district)
+          filter.recipientDistrict = { $regex: district, $options: "i" };
+        if (upazila)
+          filter.recipientUpazila = { $regex: upazila, $options: "i" };
+
+        // Urgency level filter
+        if (urgencyLevel) {
+          const validUrgencyLevels = ["low", "medium", "high", "critical"];
+          if (validUrgencyLevels.includes(urgencyLevel)) {
+            filter.urgencyLevel = urgencyLevel;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid urgency level",
+              validUrgencyLevels,
+            });
+          }
+        }
+
+        // Contact person filter
+        if (contactPerson) {
+          filter.contactPerson = { $regex: contactPerson, $options: "i" };
+        }
+
+        // Date range filter
+        if (startDate || endDate) {
+          filter.createdAt = {};
+          if (startDate) {
+            const start = new Date(startDate);
+            if (isNaN(start.getTime())) {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid start date format",
+              });
+            }
+            filter.createdAt.$gte = start;
+          }
+          if (endDate) {
+            const end = new Date(endDate);
+            if (isNaN(end.getTime())) {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid end date format",
+              });
+            }
+            // Set end time to end of day
+            end.setHours(23, 59, 59, 999);
+            filter.createdAt.$lte = end;
+          }
+        }
+
+        // Search filter
+        if (search) {
+          filter.$or = [
+            { patientName: { $regex: search, $options: "i" } },
+            { hospitalName: { $regex: search, $options: "i" } },
+            { hospitalAddress: { $regex: search, $options: "i" } },
+            { reason: { $regex: search, $options: "i" } },
+            { message: { $regex: search, $options: "i" } },
+            { contactPerson: { $regex: search, $options: "i" } },
+            { contactEmail: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        // Execute queries in parallel
+        const [requests, totalCount] = await Promise.all([
+          emergencyRequestCollection
+            .find(filter)
+            .sort(sort)
+            .skip(skip)
+            .limit(limitNumber)
+            .toArray(),
+          emergencyRequestCollection.countDocuments(filter),
+        ]);
+
+        const totalPages = Math.ceil(totalCount / limitNumber);
+        res.status(200).json({
+          success: true,
+          data: requests,
+          pagination: {
+            totalItems: totalCount,
+            totalPages,
+            currentPage: pageNumber,
+            itemsPerPage: limitNumber,
+            hasNext: pageNumber < totalPages,
+            hasPrevious: pageNumber > 1,
+          },
+          filters: {
+            status,
+            bloodGroup,
+            district,
+            upazila,
+            urgencyLevel,
+            contactPerson,
+            startDate,
+            endDate,
+            search,
+            sortBy,
+            sortOrder,
+          },
+        });
+      } catch (error) {
+        console.error("Error fetching emergency requests:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
+
+    // GET donations made by current user (as donor)
     app.get("/api/donations/my-donations", verifyJWT, async (req, res) => {
       try {
         const email = req.userEmail;
-        console.log(email);
-        const requests = await donationRequestCollection
-          .find({ "donor.email": email })
-          .toArray();
+        const {
+          status,
+          page = 1,
+          limit = 10,
+          sortBy = "donatedAt",
+          sortOrder = "desc",
+        } = req.query;
+        const pageNumber = parseInt(page);
+        const limitNumber = parseInt(limit);
+        const skip = (pageNumber - 1) * limitNumber;
 
-        res.json({ success: true, data: requests });
+        // Validate pagination parameters
+        if (isNaN(pageNumber) || pageNumber < 1) {
+          return res.status(400).json({
+            success: false,
+            error: "Page must be a positive integer",
+          });
+        }
+        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+          return res.status(400).json({
+            success: false,
+            error: "Limit must be between 1 and 100",
+          });
+        }
+
+        // Build filter
+        const filter = { "donor.email": email };
+
+        // Add status filter if provided
+        if (status && status !== "all") {
+          const validStatuses = ["inprogress", "done"];
+          if (validStatuses.includes(status)) {
+            filter.status = status;
+          } else {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid status value",
+              validStatuses,
+            });
+          }
+        }
+
+        // Validate sort parameters
+        const validSortFields = [
+          "donatedAt",
+          "createdAt",
+          "hospitalName",
+          "bloodGroup",
+        ];
+        if (!validSortFields.includes(sortBy)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid sort field",
+            validSortFields,
+          });
+        }
+        const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+
+        // Query both collections and combine results
+        const [donationRequests, emergencyRequests] = await Promise.all([
+          donationRequestCollection
+            .find(filter)
+            .sort(sort)
+            .skip(skip)
+            .limit(limitNumber)
+            .toArray(),
+          emergencyRequestCollection
+            .find(filter)
+            .sort(sort)
+            .skip(skip)
+            .limit(limitNumber)
+            .toArray(),
+        ]);
+
+        // Combine results and add requestType field
+        const combinedRequests = [
+          ...donationRequests.map((req) => ({
+            ...req,
+            requestType: "donation",
+          })),
+          ...emergencyRequests.map((req) => ({
+            ...req,
+            requestType: "emergency",
+          })),
+        ];
+
+        // Sort combined results if needed
+        combinedRequests.sort((a, b) => {
+          if (sort[sortBy] === 1) {
+            return a[sortBy] > b[sortBy] ? 1 : -1;
+          } else {
+            return a[sortBy] < b[sortBy] ? 1 : -1;
+          }
+        });
+
+        // Get total counts
+        const [donationCount, emergencyCount] = await Promise.all([
+          donationRequestCollection.countDocuments(filter),
+          emergencyRequestCollection.countDocuments(filter),
+        ]);
+
+        const totalCount = donationCount + emergencyCount;
+        const totalPages = Math.ceil(totalCount / limitNumber);
+
+        res.json({
+          success: true,
+          data: combinedRequests,
+          pagination: {
+            totalItems: totalCount,
+            totalPages,
+            currentPage: pageNumber,
+            itemsPerPage: limitNumber,
+            hasNext: pageNumber < totalPages,
+            hasPrevious: pageNumber > 1,
+          },
+        });
       } catch (error) {
-        console.error("Error fetching donation requests:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        console.error("Error fetching user donations:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
-    // get all donation requests by email
+    // GET all donation requests by requester email
     app.get(
       "/api/donations/:email/my-requests",
       verifyJWT,
       async (req, res) => {
         try {
           const email = req.params.email;
-          const { status, page = 1, limit = 10 } = req.query;
-          const skip = (parseInt(page) - 1) * parseInt(limit);
-          const filter = { requesterEmail: email };
-          if (status && status !== "all") filter.status = status;
+          const {
+            status,
+            page = 1,
+            limit = 10,
+            sortBy = "createdAt",
+            sortOrder = "desc",
+            urgencyLevel,
+            bloodGroup,
+          } = req.query;
+          const pageNumber = parseInt(page);
+          const limitNumber = parseInt(limit);
+          const skip = (pageNumber - 1) * limitNumber;
 
-          const [requests, totalCount] = await Promise.all([
+          // Validate pagination parameters
+          if (isNaN(pageNumber) || pageNumber < 1) {
+            return res.status(400).json({
+              success: false,
+              error: "Page must be a positive integer",
+            });
+          }
+          if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+            return res.status(400).json({
+              success: false,
+              error: "Limit must be between 1 and 100",
+            });
+          }
+
+          // Build filter
+          const filter = { requesterEmail: email };
+
+          // Add status filter if provided
+          if (status && status !== "all") {
+            const validStatuses = ["pending", "inprogress", "done", "canceled"];
+            if (validStatuses.includes(status)) {
+              filter.status = status;
+            } else {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid status value",
+                validStatuses,
+              });
+            }
+          }
+
+          // Add urgency level filter (only for emergency requests)
+          if (urgencyLevel) {
+            const validUrgencyLevels = ["low", "medium", "high", "critical"];
+            if (validUrgencyLevels.includes(urgencyLevel)) {
+              // This will be applied separately to emergency requests
+            } else {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid urgency level",
+                validUrgencyLevels,
+              });
+            }
+          }
+
+          // Add blood group filter
+          if (bloodGroup) {
+            const validBloodGroups = [
+              "A+",
+              "A-",
+              "B+",
+              "B-",
+              "AB+",
+              "AB-",
+              "O+",
+              "O-",
+            ];
+            if (validBloodGroups.includes(bloodGroup)) {
+              filter.bloodGroup = bloodGroup;
+            } else {
+              return res.status(400).json({
+                success: false,
+                error: "Invalid blood group",
+                validBloodGroups,
+              });
+            }
+          }
+
+          // Validate sort parameters
+          const validSortFields = [
+            "createdAt",
+            "updatedAt",
+            "date",
+            "time",
+            "hospitalName",
+            "status",
+          ];
+          if (!validSortFields.includes(sortBy)) {
+            return res.status(400).json({
+              success: false,
+              error: "Invalid sort field",
+              validSortFields,
+            });
+          }
+          const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+
+          // Query both collections
+          const donationFilter = { ...filter };
+          const emergencyFilter = { ...filter };
+
+          // Add urgency level filter to emergency requests if provided
+          if (urgencyLevel) {
+            emergencyFilter.urgencyLevel = urgencyLevel;
+          }
+
+          const [donationRequests, emergencyRequests] = await Promise.all([
             donationRequestCollection
-              .find(filter)
-              .sort({ createdAt: -1 })
+              .find(donationFilter)
+              .sort(sort)
               .skip(skip)
-              .limit(parseInt(limit))
+              .limit(limitNumber)
               .toArray(),
-            donationRequestCollection.countDocuments(filter),
+            emergencyRequestCollection
+              .find(emergencyFilter)
+              .sort(sort)
+              .skip(skip)
+              .limit(limitNumber)
+              .toArray(),
           ]);
 
-          const totalPages = Math.ceil(totalCount / parseInt(limit));
+          // Combine results and add requestType field
+          const combinedRequests = [
+            ...donationRequests.map((req) => ({
+              ...req,
+              requestType: "donation",
+            })),
+            ...emergencyRequests.map((req) => ({
+              ...req,
+              requestType: "emergency",
+            })),
+          ];
+
+          // Sort combined results if needed
+          combinedRequests.sort((a, b) => {
+            if (sort[sortBy] === 1) {
+              return a[sortBy] > b[sortBy] ? 1 : -1;
+            } else {
+              return a[sortBy] < b[sortBy] ? 1 : -1;
+            }
+          });
+
+          // Get total counts
+          const [donationCount, emergencyCount] = await Promise.all([
+            donationRequestCollection.countDocuments(donationFilter),
+            emergencyRequestCollection.countDocuments(emergencyFilter),
+          ]);
+
+          const totalCount = donationCount + emergencyCount;
+          const totalPages = Math.ceil(totalCount / limitNumber);
 
           res.json({
             success: true,
-            data: requests,
+            data: combinedRequests,
             pagination: {
               totalItems: totalCount,
               totalPages,
-              currentPage: parseInt(page),
-              itemsPerPage: parseInt(limit),
-              hasNext: parseInt(page) < totalPages,
-              hasPrevious: parseInt(page) > 1,
+              currentPage: pageNumber,
+              itemsPerPage: limitNumber,
+              hasNext: pageNumber < totalPages,
+              hasPrevious: pageNumber > 1,
+            },
+            filters: {
+              status,
+              urgencyLevel,
+              bloodGroup,
+              sortBy,
+              sortOrder,
             },
           });
         } catch (error) {
-          res
-            .status(500)
-            .json({ success: false, error: "Internal server error" });
+          console.error("Error fetching user requests:", error);
+          res.status(500).json({
+            success: false,
+            error: "Internal server error",
+            message:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
+          });
         }
       }
     );
 
-    // GET recent 3 donation requests (sorted by date descending)
+    // GET recent donation requests by requester email
     app.get("/api/donations/recent/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
-        const requests = await donationRequestCollection
-          .find({ requesterEmail: email })
-          .sort({ createdAt: -1 })
-          .limit(3)
-          .toArray();
-        res.json({ success: true, data: requests });
+        const { limit = 3 } = req.query;
+        const limitNumber = parseInt(limit);
+
+        // Validate limit parameter
+        if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 10) {
+          return res.status(400).json({
+            success: false,
+            error: "Limit must be between 1 and 10",
+          });
+        }
+
+        // Query both collections
+        const [donationRequests, emergencyRequests] = await Promise.all([
+          donationRequestCollection
+            .find({ requesterEmail: email })
+            .sort({ createdAt: -1 })
+            .limit(limitNumber)
+            .toArray(),
+          emergencyRequestCollection
+            .find({ requesterEmail: email })
+            .sort({ createdAt: -1 })
+            .limit(limitNumber)
+            .toArray(),
+        ]);
+
+        // Combine results and add requestType field
+        const combinedRequests = [
+          ...donationRequests.map((req) => ({
+            ...req,
+            requestType: "donation",
+          })),
+          ...emergencyRequests.map((req) => ({
+            ...req,
+            requestType: "emergency",
+          })),
+        ];
+
+        // Sort combined results by creation date
+        combinedRequests.sort((a, b) => b.createdAt - a.createdAt);
+
+        // Limit the total number of results
+        const limitedRequests = combinedRequests.slice(0, limitNumber);
+
+        res.json({
+          success: true,
+          data: limitedRequests,
+          count: limitedRequests.length,
+        });
       } catch (error) {
-        console.error("Error fetching donation requests:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        console.error("Error fetching recent requests:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
-    // GET single donation request by ID
-    app.get("/api/donations/:id", verifyJWT, async (req, res) => {
+    // GET single request by ID (works for both emergency and donation requests)
+    app.get("/api/requests/:id", verifyJWT, async (req, res) => {
       try {
         const id = req.params.id;
 
+        // Validate ObjectId
         if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Invalid ID format" });
+          return res.status(400).json({
+            success: false,
+            error: "Invalid ID format",
+          });
         }
-        const query = { _id: new ObjectId(id) };
-        const request = await donationRequestCollection.findOne(query);
+
+        // Try to find in donation requests collection first
+        let request = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        // If not found, try emergency requests collection
         if (!request) {
-          return res.status(404).json({ success: false, error: "Not found" });
+          request = await emergencyRequestCollection.findOne({
+            _id: new ObjectId(id),
+          });
         }
-        res.json({ success: true, data: request });
+
+        if (!request) {
+          return res.status(404).json({
+            success: false,
+            error: "Request not found",
+          });
+        }
+
+        // Add requestType field to distinguish between request types
+        if (request.patientName) {
+          request.requestType = "emergency";
+        } else {
+          request.requestType = "donation";
+        }
+
+        res.json({
+          success: true,
+          data: request,
+        });
       } catch (error) {
         console.error("Error fetching request:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
-    // POST new donation request
-    app.post("/api/donations", async (req, res) => {
+    // POST new emergency request
+    app.post("/api/emergency-request", async (req, res) => {
       try {
         const {
-          recipientName,
+          // Patient Information
+          patientName,
+          patientAge,
+          bloodGroup,
+          unitsRequired,
+          // Hospital Information
+          hospitalName,
+          hospitalAddress,
           recipientDistrict,
           recipientUpazila,
-          hospitalName,
-          fullAddress,
-          bloodGroup,
+          // Contact Information
+          contactPerson,
+          contactPhone,
+          contactEmail,
+          // Request Details
           date,
           time,
+          urgencyLevel,
+          reason,
           message,
+          // Requester Information (from form)
           requesterName,
           requesterEmail,
         } = req.body;
 
+        // Validate required fields
         const requiredFields = [
-          recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
+          patientName,
+          patientAge,
           bloodGroup,
+          unitsRequired,
+          hospitalName,
+          hospitalAddress,
+          contactPerson,
+          contactPhone,
+          contactEmail,
           date,
           time,
-          message,
+          reason,
         ];
 
-        if (requiredFields.some((f) => !f)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Missing required fields" });
+        if (
+          requiredFields.some(
+            (field) => !field || field.toString().trim() === ""
+          )
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: "All required fields must be filled",
+          });
         }
 
+        // Validate specific field formats
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(contactEmail)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format",
+          });
+        }
+
+        const phoneRegex = /^[\d\s\-\+\(\)]+$/;
+        if (!phoneRegex.test(contactPhone) || contactPhone.length < 10) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid phone number",
+          });
+        }
+
+        // Validate age
+        const age = parseInt(patientAge);
+        if (isNaN(age) || age < 1 || age > 120) {
+          return res.status(400).json({
+            success: false,
+            error: "Patient age must be between 1 and 120",
+          });
+        }
+
+        // Validate units required
+        const units = parseInt(unitsRequired);
+        if (isNaN(units) || units < 1 || units > 10) {
+          return res.status(400).json({
+            success: false,
+            error: "Units required must be between 1 and 10",
+          });
+        }
+
+        // Validate date
+        const requestDate = new Date(date);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        if (requestDate < today) {
+          return res.status(400).json({
+            success: false,
+            error: "Required date cannot be in the past",
+          });
+        }
+
+        // Validate time
+        const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
+        if (!timeRegex.test(time)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid time format (HH:MM)",
+          });
+        }
+
+        // Validate blood group
+        const validBloodGroups = [
+          "A+",
+          "A-",
+          "B+",
+          "B-",
+          "AB+",
+          "AB-",
+          "O+",
+          "O-",
+        ];
+        if (!validBloodGroups.includes(bloodGroup)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid blood group",
+          });
+        }
+
+        // Validate urgency level
+        const validUrgencyLevels = ["low", "medium", "high", "critical"];
+        if (urgencyLevel && !validUrgencyLevels.includes(urgencyLevel)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid urgency level",
+          });
+        }
+
+        // Create new emergency request object
         const newRequest = {
-          recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
+          // Patient Information
+          patientName: patientName.trim(),
+          patientAge: age,
           bloodGroup,
-          date,
-          time,
-          message,
-          requesterName,
-          requesterEmail,
+          unitsRequired: units,
+          // Hospital Information
+          hospitalName: hospitalName.trim(),
+          hospitalAddress: hospitalAddress.trim(),
+          recipientDistrict: recipientDistrict?.trim() || "",
+          recipientUpazila: recipientUpazila?.trim() || "",
+          // Contact Information
+          contactPerson: contactPerson.trim(),
+          contactPhone: contactPhone.trim(),
+          contactEmail: contactEmail.trim(),
+          // Request Details
+          date: requestDate,
+          time: time.trim(),
+          urgencyLevel: urgencyLevel || "medium",
+          reason: reason.trim(),
+          message: message.trim(),
+          // Requester Information
+          requesterName: requesterName?.trim() || contactPerson.trim(),
+          requesterEmail: requesterEmail?.trim() || contactEmail.trim(),
+          // Status and Timestamps
           status: "pending",
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
-        const result = await donationRequestCollection.insertOne(newRequest);
+        // Insert into emergency requests collection
+        const result = await emergencyRequestCollection.insertOne(newRequest);
+
+        // Return success response
         res.status(201).json({
           success: true,
           requestId: result.insertedId,
-          message: "Request created successfully",
+          message: "Emergency request created successfully",
+          data: {
+            id: result.insertedId,
+            patientName: newRequest.patientName,
+            bloodGroup: newRequest.bloodGroup,
+            hospitalName: newRequest.hospitalName,
+            status: newRequest.status,
+          },
         });
       } catch (error) {
-        console.error("Error creating donation request:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        console.error("Error creating emergency request:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+        });
       }
     });
 
-    app.patch("/api/donations/:id", verifyJWT, async (req, res) => {
+    // POST new donation request
+    app.post("/api/donation-request", async (req, res) => {
       try {
-        const { id } = req.params;
         const {
+          // Recipient Information
           recipientName,
+          recipientAge,
+          bloodGroup,
+          unitsRequired,
+          // Hospital Information
+          hospitalName,
+          hospitalAddress,
           recipientDistrict,
           recipientUpazila,
-          hospitalName,
-          fullAddress,
-          bloodGroup,
+          // Contact Information
+          contactPerson,
+          contactPhone,
+          contactEmail,
+          // Request Details
           date,
           time,
+          reason,
           message,
+          // Requester Information (from form)
+          requesterName,
+          requesterEmail,
         } = req.body;
 
-        // Basic validation
-        if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Invalid ID format" });
-        }
-
-        const updateData = {
+        // Validate required fields
+        const requiredFields = [
           recipientName,
-          recipientDistrict,
-          recipientUpazila,
-          hospitalName,
-          fullAddress,
+          recipientAge,
           bloodGroup,
+          unitsRequired,
+          hospitalName,
+          hospitalAddress,
+          contactPerson,
+          contactPhone,
+          contactEmail,
           date,
           time,
-          message,
+          reason,
+        ];
+
+        if (
+          requiredFields.some(
+            (field) => !field || field.toString().trim() === ""
+          )
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: "All required fields must be filled",
+          });
+        }
+
+        // Validate specific field formats
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(contactEmail)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format",
+          });
+        }
+
+        const phoneRegex = /^[\d\s\-\+\(\)]+$/;
+        if (!phoneRegex.test(contactPhone) || contactPhone.length < 10) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid phone number",
+          });
+        }
+
+        // Validate age
+        const age = parseInt(recipientAge);
+        if (isNaN(age) || age < 1 || age > 120) {
+          return res.status(400).json({
+            success: false,
+            error: "Recipient age must be between 1 and 120",
+          });
+        }
+
+        // Validate units required
+        const units = parseInt(unitsRequired);
+        if (isNaN(units) || units < 1 || units > 10) {
+          return res.status(400).json({
+            success: false,
+            error: "Units required must be between 1 and 10",
+          });
+        }
+
+        // Validate date
+        const requestDate = new Date(date);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        if (requestDate < today) {
+          return res.status(400).json({
+            success: false,
+            error: "Required date cannot be in the past",
+          });
+        }
+
+        // Validate time
+        const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
+        if (!timeRegex.test(time)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid time format (HH:MM)",
+          });
+        }
+
+        // Validate blood group
+        const validBloodGroups = [
+          "A+",
+          "A-",
+          "B+",
+          "B-",
+          "AB+",
+          "AB-",
+          "O+",
+          "O-",
+        ];
+        if (!validBloodGroups.includes(bloodGroup)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid blood group",
+          });
+        }
+
+        // Create new donation request object
+        const newRequest = {
+          // Recipient Information
+          recipientName: recipientName.trim(),
+          recipientAge: age,
+          bloodGroup,
+          unitsRequired: units,
+          // Hospital Information
+          hospitalName: hospitalName.trim(),
+          hospitalAddress: hospitalAddress.trim(),
+          recipientDistrict: recipientDistrict?.trim() || "",
+          recipientUpazila: recipientUpazila?.trim() || "",
+          // Contact Information
+          contactPerson: contactPerson.trim(),
+          contactPhone: contactPhone.trim(),
+          contactEmail: contactEmail.trim(),
+          // Request Details
+          date: requestDate,
+          time: time.trim(),
+          reason: reason.trim(),
+          message: message.trim(),
+          // Requester Information
+          requesterName: requesterName?.trim() || contactPerson.trim(),
+          requesterEmail: requesterEmail?.trim() || contactEmail.trim(),
+          // Status and Timestamps
+          status: "pending",
+          createdAt: new Date(),
           updatedAt: new Date(),
-          status: "pending", // Reset status when edited
         };
 
-        const result = await donationRequestCollection.updateOne(
+        // Insert into donation requests collection
+        const result = await donationRequestCollection.insertOne(newRequest);
+
+        // Return success response
+        res.status(201).json({
+          success: true,
+          requestId: result.insertedId,
+          message: "Donation request created successfully",
+          data: {
+            id: result.insertedId,
+            recipientName: newRequest.recipientName,
+            bloodGroup: newRequest.bloodGroup,
+            hospitalName: newRequest.hospitalName,
+            status: newRequest.status,
+          },
+        });
+      } catch (error) {
+        console.error("Error creating donation request:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+        });
+      }
+    });
+
+    // PATCH request (update) - works for both emergency and donation requests
+    app.patch("/api/requests/:id", verifyJWT, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const updateData = req.body;
+
+        // Validate ObjectId
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid ID format",
+          });
+        }
+
+        // Determine which collection to use
+        let collection;
+        let request = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (request) {
+          collection = donationRequestCollection;
+        } else {
+          request = await emergencyRequestCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (request) {
+            collection = emergencyRequestCollection;
+          } else {
+            return res.status(404).json({
+              success: false,
+              error: "Request not found",
+            });
+          }
+        }
+
+        // Only allow updates if status is pending
+        if (request.status !== "pending") {
+          return res.status(400).json({
+            success: false,
+            error: "Only pending requests can be updated",
+          });
+        }
+
+        // Add updatedAt timestamp
+        updateData.updatedAt = new Date();
+
+        // Update the request
+        const result = await collection.updateOne(
           { _id: new ObjectId(id) },
           { $set: updateData }
         );
 
         if (result.matchedCount === 0) {
-          return res
-            .status(404)
-            .json({ success: false, error: "Request not found" });
+          return res.status(404).json({
+            success: false,
+            error: "Request not found",
+          });
         }
 
         res.json({
@@ -1518,14 +2636,16 @@ async function run() {
           data: updateData,
         });
       } catch (error) {
-        console.error("Error updating donation request:", error);
-        res
-          .status(500)
-          .json({ success: false, error: "Internal server error" });
+        console.error("Error updating request:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+        });
       }
     });
 
-    app.patch("/api/donations/:id/donate", verifyJWT, async (req, res) => {
+    // PATCH request (confirm donation) - works for both emergency and donation requests
+    app.patch("/api/requests/:id/donate", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
         const { status, donor, donationId } = req.body;
@@ -1553,29 +2673,50 @@ async function run() {
           });
         }
 
-        // Additional validation to prevent self-donation
-        const existingRequest = await donationRequestCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        if (!existingRequest) {
-          return res.status(404).json({
+        // Validate donor email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(donor.email)) {
+          return res.status(400).json({
             success: false,
-            error: "Request not found",
+            error: "Invalid donor email format",
           });
         }
 
-        if (existingRequest.requesterEmail === donor.email) {
+        // Determine which collection to use
+        let collection;
+        let request = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (request) {
+          collection = donationRequestCollection;
+        } else {
+          request = await emergencyRequestCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (request) {
+            collection = emergencyRequestCollection;
+          } else {
+            return res.status(404).json({
+              success: false,
+              error: "Request not found",
+            });
+          }
+        }
+
+        // Prevent self-donation
+        if (request.requesterEmail === donor.email) {
           return res.status(400).json({
             success: false,
             error: "Cannot donate to your own request",
           });
         }
 
-        if (existingRequest.status !== "pending") {
+        // Check if request is still available for donation
+        if (request.status !== "pending") {
           return res.status(400).json({
             success: false,
-            error: "Request is no longer available for donation",
+            error: `Request is no longer available for donation (current status: ${request.status})`,
           });
         }
 
@@ -1592,7 +2733,8 @@ async function run() {
           },
         };
 
-        const result = await donationRequestCollection.updateOne(
+        // Update the request
+        const result = await collection.updateOne(
           { _id: new ObjectId(id) },
           updateDoc
         );
@@ -1604,16 +2746,15 @@ async function run() {
           });
         }
 
+        // Return success response
         res.json({
           success: result.modifiedCount === 1,
-          message:
-            result.modifiedCount === 1
-              ? "Donation confirmed successfully"
-              : "No changes made",
+          message: "Donation confirmed successfully",
           data: {
             donationId: id,
             donor: donor.email,
             status,
+            donatedAt: new Date(),
           },
         });
       } catch (error) {
@@ -1627,11 +2768,11 @@ async function run() {
       }
     });
 
-    // Update donation status
-    app.patch("/api/donations/status/:id", verifyJWT, async (req, res) => {
+    // Update request status (admin only) - works for both emergency and donation requests
+    app.patch("/api/requests/status/:id", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, notes } = req.body;
         const validStatuses = ["pending", "inprogress", "done", "canceled"];
 
         if (!validStatuses.includes(status)) {
@@ -1642,9 +2783,48 @@ async function run() {
           });
         }
 
-        const result = await donationRequestCollection.updateOne(
+        // Determine which collection to use
+        let collection;
+        let request = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (request) {
+          collection = donationRequestCollection;
+        } else {
+          request = await emergencyRequestCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (request) {
+            collection = emergencyRequestCollection;
+          } else {
+            return res.status(404).json({
+              success: false,
+              error: "Request not found",
+            });
+          }
+        }
+
+        // Prepare update data
+        const updateData = {
+          status,
+          updatedAt: new Date(),
+        };
+
+        // Add notes if provided
+        if (notes !== undefined) {
+          updateData.notes = notes.trim();
+        }
+
+        // Add completion timestamp if status is "done"
+        if (status === "done") {
+          updateData.completedAt = new Date();
+        }
+
+        // Update the request
+        const result = await collection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status, updatedAt: new Date() } }
+          { $set: updateData }
         );
 
         if (result.modifiedCount === 0) {
@@ -1659,9 +2839,10 @@ async function run() {
           message: "Status updated successfully",
           updatedId: id,
           newStatus: status,
+          updatedData: updateData,
         });
       } catch (error) {
-        console.error("Error updating donation status:", error);
+        console.error("Error updating request status:", error);
         res.status(500).json({
           success: false,
           error: "Internal server error",
@@ -1670,11 +2851,69 @@ async function run() {
       }
     });
 
-    app.delete("/api/donations/:id", verifyJWT, async (req, res) => {
-      const result = await donationRequestCollection.deleteOne({
-        _id: new ObjectId(req.params.id),
-      });
-      res.json({ success: result.deletedCount === 1 });
+    // DELETE request - works for both emergency and donation requests
+    app.delete("/api/requests/:id", verifyJWT, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        // Validate ObjectId
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid ID format",
+          });
+        }
+
+        // Determine which collection to use
+        let collection;
+        let request = await donationRequestCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (request) {
+          collection = donationRequestCollection;
+        } else {
+          request = await emergencyRequestCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (request) {
+            collection = emergencyRequestCollection;
+          } else {
+            return res.status(404).json({
+              success: false,
+              error: "Request not found",
+            });
+          }
+        }
+
+        // Only allow deletion of pending requests
+        if (request.status !== "pending") {
+          return res.status(400).json({
+            success: false,
+            error: `Cannot delete request with status: ${request.status}`,
+          });
+        }
+
+        // Delete the request
+        const result = await collection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.json({
+          success: result.deletedCount === 1,
+          message:
+            result.deletedCount === 1
+              ? "Request deleted successfully"
+              : "Failed to delete request",
+        });
+      } catch (error) {
+        console.error("Error deleting request:", error);
+        res.status(500).json({
+          success: false,
+          error: "Internal server error",
+          message: error.message,
+        });
+      }
     });
 
     // Get all blogs with filtering and pagination
@@ -2392,8 +3631,6 @@ async function run() {
         });
       }
     });
-
-    console.log("✅ MongoDB Connected");
   } catch (err) {
     console.error("❌ DB connection error:", err);
   }
